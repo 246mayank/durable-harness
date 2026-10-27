@@ -81,23 +81,29 @@ class FaultMiddleware:
             await self.app(scope, receive, send)
             return
         fault, status = self.platform.faults.roll()
-        headers = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
-        self.platform.log_request(
-            scope["method"], scope["path"], headers.get("x-run-id"), headers.get("x-trace-id"), fault
-        )
+        handler_status = None
         if fault in (Fault.RATE_LIMIT, Fault.SERVER_ERROR):
             extra = {"Retry-After": "0"} if status == 429 else None
             await JSONResponse({"error": fault.value}, status, headers=extra)(scope, receive, send)
-            return
-        if fault is Fault.LOST_ACK:
+        else:
 
-            async def discard(message) -> None:
-                pass
+            async def forward(message) -> None:
+                nonlocal handler_status
+                if message["type"] == "http.response.start":
+                    handler_status = message["status"]
+                if fault is not Fault.LOST_ACK:
+                    await send(message)
 
-            await self.app(scope, receive, discard)
-            await JSONResponse({"error": "gateway timeout"}, 504)(scope, receive, send)
-            return
-        await self.app(scope, receive, send)
+            await self.app(scope, receive, forward)
+            if fault is Fault.LOST_ACK:
+                await JSONResponse({"error": "gateway timeout"}, 504)(scope, receive, send)
+            else:
+                status = handler_status
+        headers = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
+        self.platform.log_request(
+            scope["method"], scope["path"], headers.get("x-run-id"), headers.get("x-trace-id"),
+            fault, handler_status, status,
+        )
 
 
 class Platform:
@@ -105,11 +111,13 @@ class Platform:
         self.db = PlatformDB(db_path)
         self.faults = FaultInjector(faults)
 
-    def log_request(self, method, path, run_id, trace_id, fault: Fault) -> None:
+    def log_request(self, method, path, run_id, trace_id, fault: Fault,
+                    handler_status: int | None, status: int | None) -> None:
         with self.db.tx() as conn:
             conn.execute(
-                "INSERT INTO requests (method, path, run_id, trace_id, fault) VALUES (?,?,?,?,?)",
-                (method, path, run_id, trace_id, fault.value),
+                "INSERT INTO requests (method, path, run_id, trace_id, fault, handler_status, status)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (method, path, run_id, trace_id, fault.value, handler_status, status),
             )
 
     def idempotent(
@@ -319,7 +327,8 @@ def create_app(db_path: str = ":memory:", faults: FaultConfig | None = None) -> 
 
     @app.get("/_admin/requests")
     def get_requests(run_id: str | None = None):
-        sql = "SELECT seq, method, path, run_id, trace_id, fault FROM requests"
+        sql = ("SELECT seq, method, path, run_id, trace_id, fault, handler_status, status"
+               " FROM requests")
         if run_id:
             return {"requests": platform.db.query(sql + " WHERE run_id = ? ORDER BY seq", (run_id,))}
         return {"requests": platform.db.query(sql + " ORDER BY seq")}

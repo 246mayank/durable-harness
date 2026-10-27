@@ -37,10 +37,12 @@ CREATE TABLE IF NOT EXISTS effects (
     kind TEXT, object_id TEXT, run_id TEXT, trace_id TEXT,
     amount INTEGER, payload TEXT
 );
--- Every non-admin request and the fault it drew.
+-- Every non-admin request, the fault it drew, the status the handler
+-- produced and the status the client actually saw.
 CREATE TABLE IF NOT EXISTS requests (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    method TEXT, path TEXT, run_id TEXT, trace_id TEXT, fault TEXT
+    method TEXT, path TEXT, run_id TEXT, trace_id TEXT, fault TEXT,
+    handler_status INTEGER, status INTEGER
 );
 """
 
