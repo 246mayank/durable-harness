@@ -101,6 +101,7 @@ def run_scenario(
     hook_factory: Callable[[int], Callable | None] | None = None,
     operator: Callable = audit_operator,
     keep_events: bool = False,
+    planner_factory: Callable[[int, float], Any] = ScriptedPlanner,
 ) -> RunReport:
     """Run one scenario under one config to completion (or the incarnation limit)."""
     tools = tools or campaign_tools()
@@ -113,7 +114,7 @@ def run_scenario(
             TestClient(create_app(faults=scenario.faults)) as client:
         path = Path(tmp) / "journal.db"
         for n in range(MAX_INCARNATIONS):
-            planner = ScriptedPlanner(planner_seed(scenario.seed, n), scenario.temperature)
+            planner = planner_factory(planner_seed(scenario.seed, n), scenario.temperature)
             hook = hook_factory(n) if hook_factory else armed
             with Journal(path, durability) as journal:
                 runtime = Runtime(journal, tools, client, config, crash_hook=hook)
