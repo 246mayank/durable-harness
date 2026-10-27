@@ -9,12 +9,14 @@ different draw); a crash is a `SimulatedCrash` raised from a crash point.
 from __future__ import annotations
 
 import tempfile
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from fastapi.testclient import TestClient
+warnings.filterwarnings("ignore", message="Using `httpx` with `starlette.testclient`")
+from fastapi.testclient import TestClient  # noqa: E402
 
 from agents.campaign import CampaignGoal, ScriptedPlanner, campaign_tools
 from chaos.invariants import Check, check
