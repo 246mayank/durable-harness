@@ -33,7 +33,9 @@ MAX_INCARNATIONS = 12
 class Scenario:
     seed: int
     faults: FaultConfig = FaultConfig()
-    # One entry per incarnation: crash at the nth time that incarnation passes `point`.
+    # Crashes in order: each (point, nth) fires at the nth pass of `point` after
+    # the previous crash. It stays armed across restarts that aren't crashes
+    # (escalations, suspensions), so pausing for an operator never skips one.
     crashes: tuple[tuple[str, int], ...] = ()
     temperature: float = 0.0
 
@@ -104,22 +106,23 @@ def run_scenario(
     tools = tools or campaign_tools()
     run_id = f"run-{scenario.seed}"
     report = RunReport(config.name, scenario.seed, scenario.temperature)
-    if hook_factory is None:
-        def hook_factory(n: int):
-            return CrashAt(*scenario.crashes[n]) if n < len(scenario.crashes) else None
+    schedule = (CrashAt(point, nth) for point, nth in scenario.crashes)
+    armed = next(schedule, None)
 
     with tempfile.TemporaryDirectory(dir=journal_dir) as tmp, \
             TestClient(create_app(faults=scenario.faults)) as client:
         path = Path(tmp) / "journal.db"
         for n in range(MAX_INCARNATIONS):
             planner = ScriptedPlanner(planner_seed(scenario.seed, n), scenario.temperature)
+            hook = hook_factory(n) if hook_factory else armed
             with Journal(path, durability) as journal:
-                runtime = Runtime(journal, tools, client, config, crash_hook=hook_factory(n))
+                runtime = Runtime(journal, tools, client, config, crash_hook=hook)
                 report.incarnations += 1
                 try:
                     outcome = runtime.run(run_id, goal, planner)
                 except SimulatedCrash:
                     report.crashes += 1
+                    armed = next(schedule, None)
                     continue
                 finally:
                     report.planner_calls += planner.calls
