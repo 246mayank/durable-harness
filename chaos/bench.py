@@ -217,8 +217,10 @@ def render_resume_numbers(by_config: dict[str, list[RunReport]], n: int) -> str:
         f"in {s['harness']['esc_runs']} runs; with conditional writes: "
         f"**{s['harness_cas']['escalations']}**" if "harness_cas" in s else "",
         "",
-        "Wording rules: say \"simulated platform\", \"seeded scenarios\", \"built and evaluated\", "
-        "\"scripted planner\" and \"in-process crash injection\". Never \"exactly-once\", "
+        "Wording rules: say \"simulated platform\", \"seeded scenarios\" and \"built and evaluated\". "
+        "The numbers above come from the scripted planner with in-process crash injection; the "
+        "hard-kill numbers (separate OS processes) are in sigkill.md and the small real-LLM run "
+        "is in llm.md, so cite those files for those claims. Never \"exactly-once\", "
         "\"production\" or \"deployed\".",
         "",
     ])

@@ -174,9 +174,10 @@ class Runtime:
     # ---- calling and recovering -----------------------------------------------
 
     def _send(self, state: RunState, step: StepState, tool: Tool, args: Any,
-              ctx: CallContext) -> Outcome | None:
+              ctx: CallContext, in_doubt: bool = False) -> Outcome | None:
+        """Send with retries. `in_doubt`: an earlier attempt may already have applied."""
         aware = self.config.effect_aware
-        ambiguous = False
+        ambiguous = in_doubt
         last: ToolError | None = None
         for n in range(self.config.retries + 1):
             if n and self.backoff:
@@ -215,7 +216,9 @@ class Runtime:
         intent = step.intent
         ctx = CallContext(state.run_id, step.index, intent["key"], intent.get("precondition"))
         if not self.config.effect_aware or tool.effect in (Effect.READ, Effect.IDEMPOTENT):
-            return self._send(state, step, tool, args, ctx)
+            # Even if every re-send is now refused outright, the original may have
+            # applied: the step stays in doubt and must not go back to the planner.
+            return self._send(state, step, tool, args, ctx, in_doubt=True)
         if tool.effect is Effect.RECONCILABLE:
             found = self._reconcile(state, step, tool, args, ctx)
             return self._send(state, step, tool, args, ctx) if found is _ABSENT else found

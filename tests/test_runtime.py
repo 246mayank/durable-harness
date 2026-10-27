@@ -54,6 +54,27 @@ def test_lost_ack_on_email_suspends_then_reconciles_by_lookup():
         assert [e["kind"] for e in effects] == ["email_batch"]
 
 
+def test_resumed_step_refused_on_every_retry_stays_in_doubt():
+    # The original call applied, then the process died before journaling the
+    # result. If every re-send is now refused with 429, the step is still in
+    # doubt: it must suspend, not tell the planner the call "failed".
+    goal = CampaignGoal()
+    args = {"name": "n", "product": goal.product, "audience": goal.audience}
+    with TestClient(create_app()) as client, Journal() as journal:
+        journal.append("r", "decision", 0, {"tool": "create_campaign", "args": args})
+        journal.append("r", "intent", 0, {"tool": "create_campaign", "args": args, "key": "k0",
+                                           "effect": "idempotent"})
+        client.post("/v1/campaigns", json=args, headers={"Idempotency-Key": "k0", "X-Run-Id": "r"})
+        client.post("/_admin/faults", json={"p_429": 1.0})
+        first = Runtime(journal, campaign_tools(), client, HARNESS).run("r", goal, Finisher())
+        assert first.status == "suspended"
+        client.post("/_admin/faults", json={})
+        second = Runtime(journal, campaign_tools(), client, HARNESS).run("r", goal, Finisher())
+        assert second.status == "finished"
+        assert journal.load_state("r").steps[0].result["status"] == "ok"
+        assert len(client.get("/_admin/effects").json()["effects"]) == 1
+
+
 def test_crash_after_send_on_unsafe_call_escalates_and_operator_confirms():
     report = run_scenario(Scenario(seed=2), HARNESS, hook_factory=crash_once("after_send", ALLOCATE_STEP),
                           keep_events=True)
