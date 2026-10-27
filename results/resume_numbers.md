@@ -10,4 +10,4 @@ Generated with results.md; copy numbers from here only.
   - of which on endpoints with no key support (email batches + allocations): **683**
 - harness escalations to a human: **228** in 184 runs; with conditional writes: **0**
 
-Wording rules: say "simulated platform", "seeded scenarios", "built and evaluated", "scripted planner" and "in-process crash injection". Never "exactly-once", "production" or "deployed".
+Wording rules: say "simulated platform", "seeded scenarios" and "built and evaluated". The numbers above come from the scripted planner with in-process crash injection; the hard-kill numbers (separate OS processes) are in sigkill.md and the small real-LLM run is in llm.md, so cite those files for those claims. Never "exactly-once", "production" or "deployed".
