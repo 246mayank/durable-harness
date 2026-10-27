@@ -1,1 +1,266 @@
 # durable-harness
+
+**A Python agent runtime that resumes from a log instead of restarting, so side-effecting tool calls take effect once.**
+
+Agents that act on the world fail halfway through: they create an ad, send an email, move budget, and then the process dies, a response gets lost after the server committed, or a retry fires. `durable-harness` journals every planner decision and every tool intent to a SQLite write-ahead log *before* acting. After a crash it **replays the log rather than re-asking the planner**. Each call whose outcome is unknown is recovered according to the tool's declared **effect class**: re-send it, re-send it under the same key, look it up, or escalate it to a human.
+
+The guarantee is **at-least-once execution with idempotent effects**. A request may go out more than once, but its effect lands once. A call that can't be made safe is escalated, never guessed. The runtime is built and evaluated against a **simulated** ad/email platform with seeded fault injection. A B2B campaign agent drives it, using a scripted planner at scale and a real LLM for a small sample.
+
+## Why resume, not restart
+
+Say a campaign agent crashes after creating the campaign and two ads. The obvious recovery is to run it again, but a planner asked again is a new draw. An LLM at temperature > 0 writes different ad copy, maybe in a different order. Every re-planned call carries new arguments, so even idempotency keys hashed from those arguments stop matching. The platform sees brand-new requests: duplicate ads, a second email blast to the same trial users, double spend.
+
+Lost responses do the same damage with no crash at all. A request whose response is lost *after* the platform committed (a timeout, a 504 from a proxy) looks exactly like one that never arrived. Retrying a call with no idempotency support duplicates it; not retrying may drop it.
+
+So the runtime does three things:
+
+1. **It never re-asks a decided step.** Decisions are journaled, and a restart replays them. The planner is consulted only for steps it has never decided.
+2. **It keys by position, not by arguments.** A step's idempotency key is `hash(run_id, step)`. Replay pins step N to one decision, so a resumed step re-sends the same arguments under the same key.
+3. **It recovers by effect class.** What is safe to do with an unknown outcome depends on the API, so each tool declares it.
+
+## Results
+
+Every scenario is replayed against five configurations of the same loop, each with pieces switched off:
+
+| config | replay | idempotency keys | retries | effect-aware recovery |
+|---|---|---|---|---|
+| `naive` | no | none | 0 | no |
+| `naive_retry` | no | none | 5 | no |
+| `keys_only` | no | hash of the arguments | 5 | no |
+| `harness` | yes | positional | 5 | yes |
+| `harness_cas` | yes | positional | 5 | yes, plus conditional writes on allocations |
+
+A clean run makes 9 planner calls and leaves exactly 1 campaign, 3 ads, 1 email batch and 2 allocations ($700). Every number below is counted from the platform's own audit log, not from what the agent believes.
+
+<!-- results:start -->
+<!-- results:end -->
+
+How to read it:
+
+- **Duplicates by kind is where the explanation lives.** `keys_only` never duplicates a campaign, and duplicates ads only above temperature 0, where a re-planned run writes new copy ([by-temperature table](results/results.md#by-planner-temperature)). Its email and allocation duplicates come from endpoints that have no key support at all.
+- **Escalations are the price.** The plain harness never guesses about an allocation whose outcome it doesn't know, so it stops and asks. Each escalation is a person checking a dashboard. Conditional writes (`harness_cas`) make that outcome checkable and remove the escalations.
+- **Crashes injected** is lower for the harness because a run resumed from its journal has fewer steps left in which a crash can land. The crash-matrix test separately forces a crash at every crash point of every step.
+
+### Hard process kills
+
+The main benchmark crashes in-process. This one runs the agent and the platform as separate OS processes and kills the agent from outside at a random point of its run.
+
+<!-- sigkill:start -->
+<!-- sigkill:end -->
+
+### A real LLM planner (small N)
+
+<!-- llm:start -->
+<!-- llm:end -->
+
+## How it works
+
+### Write order and crash windows
+
+Each step is written to the journal in this order, with every event its own committed SQLite transaction:
+
+```
+decision  ->  intent (before the call)  ->  attempt*  ->  result (after the call)
+```
+
+| crash happens | journal holds | on restart |
+|---|---|---|
+| before the decision is written | earlier steps only | ask the planner: nothing was decided or sent |
+| after the decision (`after_decision`) | decision | replay the decision and make the call |
+| after the intent, before the send (`after_intent`) | decision, intent | outcome unknown: recover by effect class |
+| after the platform applied it, before the result was journaled (`after_send`) | decision, intent | the same, and this is the nasty one |
+| after the result (`after_result`) | decision, ..., result | step done: ask the planner for the next one |
+
+The crash-matrix test injects a crash at each of the four points, at each of the 9 steps, at temperature 0 and 0.7. A second variant crashes again in the same place during recovery. In every cell the harness finishes with no duplicate, missing or excess effect, in exactly 9 planner calls.
+
+### Failure taxonomy
+
+Failures are classified by what the caller knows, not by what the server did ([harness/errors.py](harness/errors.py)):
+
+| class | triggers | meaning |
+|---|---|---|
+| `NotApplied` | connection refused, connect timeout, 429 | definitely not processed: always safe to retry |
+| `Ambiguous` | 5xx, 504, read/write timeout, connection reset | may have taken effect |
+| `Rejected` | any other 4xx | processed and refused: don't retry, tell the planner |
+
+A 500 counts as ambiguous even though this simulator's 500s always happen before commit. A real service can commit and then fail: it crashes while serializing the response, a post-commit hook throws, or a proxy sits in between. Only the server knows, and it didn't say. That conservatism costs escalations, and the benchmark counts them.
+
+### Effect classes
+
+| effect | tool | when the outcome is unknown |
+|---|---|---|
+| read | `get_metrics` | re-send |
+| idempotent | `create_campaign`, `create_ad` | re-send with the same `Idempotency-Key`; the platform replays its stored response |
+| reconcilable | `send_email_batch` | look it up by `client_ref` (the key); send only if absent |
+| unsafe | `allocate_budget` | escalate to a human; never guess |
+
+The planner never sees an unknown outcome of a side-effecting call, because it would re-plan the call as a new step under a new key. If retries run out while the outcome is still unknown, the run suspends, and the next incarnation recovers the step from its intent.
+
+A tool is a plain function with a Pydantic argument model:
+
+```python
+@tool(Effect.RECONCILABLE, SendEmailArgs)
+def send_email_batch(client, args, ctx):
+    return request(client, "POST", "/v1/email/batches",
+                   json={**args.model_dump(), "client_ref": ctx.key}, headers=ctx.headers())
+
+@send_email_batch.reconciler
+def _find_email_batch(client, args, ctx):
+    found = request(client, "GET", "/v1/email/batches", params={"client_ref": ctx.key})["items"]
+    return found[0] if found else None
+```
+
+### Idempotency keys
+
+There are three modes, so they can be compared:
+
+- `none`: no key.
+- `args`: `hash(run_id, tool, args)`.
+- `positional`: `hash(run_id, step)`.
+
+Argument keys hold only while a re-planned call reproduces its arguments, which is true at temperature 0 and false above it. Positional keys are stable for a step whatever its arguments. They are correct **only together with replay**, because the journal pins step N to one decision. Without replay, step N after a restart could be a different call, and its positional key would collide with the old one. The platform answers that with a 409, and the benchmark's 409 column checks that it never happens.
+
+### Escalation, approvals and budget
+
+- **Escalation.** `resolve(journal, run_id, applied=True, value=...)` records an operator's answer. `applied=False` voids the intent, so the step re-executes under the same key. In the benchmark the "operator" looks the call's trace id up in the platform's audit log. That models a person checking the dashboard, which takes real time.
+- **Approval gate.** With approvals on, an unsafe call stops in `awaiting_approval` until `approve(journal, run_id, step, args_hash)` is called. The approval is bound to a hash of the arguments, so approving $500 can't authorize $5,000.
+- **Budget reservation.** With a cap set, an unsafe call is refused if committed spend, plus spend whose outcome is still unknown, plus this call would exceed the cap.
+
+### Conditional writes
+
+The allocation API is unsafe because nothing identifies a lost allocation. A precondition makes it checkable. The harness reads the campaign's total before writing the intent, journals that total with the intent, and sends it as `expected_total`. After a lost response:
+
+- **Total unchanged:** it wasn't applied, so re-send. The re-send can't double-apply, because its precondition would fail.
+- **Total grew by the amount:** it was applied.
+- **Anything else:** escalate.
+
+`harness_cas` in the results is the same runtime with this variant of the tool.
+
+### Journal durability
+
+The journal runs in WAL mode with `synchronous=FULL`, so every commit fsyncs the WAL. An intent is therefore on disk before the call it describes goes out, even through an OS crash or power loss. `synchronous=NORMAL` survives a process kill, because committed frames sit in the OS page cache, but it can lose the last few commits on power failure. A lost intent for a call that did go out is exactly what the journal exists to prevent. FULL is the default and what every result here uses. It roughly doubles wall time per run in the hard-kill runner, at one fsync per event. The tests exercise process death, not power loss.
+
+## Layout
+
+```
+harness/       runtime.py      the loop, effect-class recovery, resolve() / approve()
+               journal.py      append-only SQLite log and the run state folded from it
+               tools.py        tool registry, effect classes, call context
+               errors.py       NotApplied / Ambiguous / Rejected
+               keys.py         none / args / positional idempotency keys
+               trace.py        python -m harness.trace: a run's journal as a timeline
+agents/        campaign.py     campaign tools, goal and scripted planner
+               llm_planner.py  Gemini function-calling planner behind the same interface
+               __main__.py     python -m agents: the agent over real HTTP
+platform_sim/  app.py faults.py db.py __main__.py    FastAPI + SQLite simulator
+chaos/         driver.py       in-process crash driver and audit-log operator
+               invariants.py   ground-truth checks
+               scenarios.py    seeded scenario generation
+               bench.py        -> results/results.md
+               sigkill.py      separate processes, hard kills -> results/sigkill.md
+               llm_ablation.py -> results/llm.md
+tests/         platform, journal, errors, runtime, crash matrix, baselines, Hypothesis properties
+results/       generated only, never hand-edited
+```
+
+The runtime itself (`harness/`) is about 800 lines.
+
+## Running it
+
+Python 3.11+.
+
+```bash
+python -m venv .venv
+```
+
+```bash
+.venv/bin/pip install -e ".[dev]"
+```
+
+On Windows, use `.venv\Scripts\pip` instead.
+
+```bash
+pytest
+```
+
+This includes the crash matrix and the Hypothesis crash schedules. The three generators:
+
+```bash
+python -m chaos.bench
+```
+
+```bash
+python -m chaos.sigkill
+```
+
+```bash
+python -m chaos.llm_ablation
+```
+
+`chaos.bench` writes `results/results.md` (500 scenarios by 5 configs, a few minutes on a laptop). `chaos.sigkill` writes `results/sigkill.md`. `chaos.llm_ablation` needs `GEMINI_API_KEY` and writes `results/llm.md`.
+
+To watch a crash and a resume by hand, start the platform in one terminal:
+
+```bash
+python -m platform_sim --port 8700 --p-lost-ack 0.1
+```
+
+Then, in another, run the agent with a hard exit midway through the first allocation:
+
+```bash
+python -m agents run --run-id demo --die-at after_send:6
+```
+
+Run it again. It resumes from the journal and escalates the allocation whose outcome it can't know:
+
+```bash
+python -m agents run --run-id demo
+```
+
+Answer the escalation the way an operator would, by checking the platform:
+
+```bash
+python -m agents resolve --run-id demo --from-audit
+```
+
+Run it once more to finish, then print the timeline:
+
+```bash
+python -m agents run --run-id demo
+```
+
+```bash
+python -m harness.trace runs/journal.db demo
+```
+
+## Honest limits
+
+- **The simulator is part of this repo.** The results measure the runtime's correctness under the failure model it injects. They say nothing about campaign performance or about how any real platform behaves.
+- **No delayed delivery.** A lost request never arrives later. Reconcile-by-lookup is safe only if an in-flight request can't commit after the lookup, so a real system needs a lookup that is consistent with in-flight writes, or fences them. The conditional-write rule ("the total grew by our amount, so it was ours") also assumes one writer per campaign.
+- **One incarnation at a time is assumed.** Nothing stops a slow "crashed" process and its replacement from both acting. Doing this for real needs a lease or a fencing token per run.
+- **Tool calls are sequential.** Parallel calls would need per-call ordinals in the key and an intent for every in-flight call.
+- **Positional keys trust the journal.** If the journal is lost or truncated, or a run id is reused for a different goal, step N may be a different call under the same key.
+- **Escalations are a real cost.** Under this fault mix the plain harness escalates often: every ambiguous allocation, including 500s that never committed in this simulator. The benchmark's operator answers instantly by reading the audit log; a person would take minutes.
+- **An unsafe intent with no send still escalates.** A crash between writing an unsafe call's intent and sending it can't be told apart from one after sending, so it escalates. A per-attempt "sending" record would narrow that window.
+- **The scripted planner runs at scale; the real LLM only at small N.**
+- **The main benchmark crashes in-process.** The hard-kill runner backs it up with real process kills, but neither one tests power loss or disk failure.
+
+## Why not just Temporal?
+
+In practice, Temporal (or DBOS, or Restate) is the right substrate for this, and it already does the central trick. Workflow code is replayed from event history, and an LLM call made as an activity is recorded, so a replay doesn't re-ask the model. What Temporal deliberately leaves to you is activity idempotency: activities run at least once, and making each external call safe to repeat is the application's job. That is the part this repo works on:
+
+- an **effect class** per tool, with a recovery rule derived from it (re-send, same key, lookup or escalate) rather than one generic retry policy;
+- **positional keys** derived from the journal position, the analogue of Temporal's workflow id plus activity id;
+- **escalation to a human** as a first-class run state, with an approval gate and budget reservation in front of unsafe calls;
+- a **ground-truth benchmark** that counts duplicates on the platform's side, not the agent's.
+
+The runtime here is small so the mechanism stays inspectable and measurable. The effect-class layer would sit on top of Temporal activities, not replace them.
+
+## Roadmap
+
+- A per-attempt `sending` record, so a crash before the send doesn't escalate.
+- Leases or fencing per run, so two incarnations can't act at once.
+- Parallel tool calls, with per-call ordinals and batched intents.
+- Platform-side lookups (allocations by client reference, say) to cut escalations without preconditions.
+- Effect classes as a library over Temporal activities.
+- A larger real-LLM evaluation.

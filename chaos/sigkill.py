@@ -23,7 +23,7 @@ from pathlib import Path
 
 import httpx
 
-from chaos.bench import RESULTS, _git_sha, _pct, _table
+from chaos.bench import RESULTS, _git_sha, _pct, _table, update_readme
 from chaos.driver import audit_operator, planner_seed
 from chaos.invariants import check
 from chaos.scenarios import generate
@@ -186,8 +186,10 @@ def main() -> None:
     finally:
         server.kill()
     args.out.mkdir(parents=True, exist_ok=True)
-    (args.out / "sigkill.md").write_text(render(rows, len(scenarios), args, window), encoding="utf-8",
-                                         newline="\n")
+    text = render(rows, len(scenarios), args, window)
+    (args.out / "sigkill.md").write_text(text, encoding="utf-8", newline="\n")
+    if args.out.resolve() == RESULTS:
+        update_readme("sigkill", text.split("\n", 2)[2].strip())
     print(f"-> {args.out / 'sigkill.md'}")
 
 
