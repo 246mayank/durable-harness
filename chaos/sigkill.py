@@ -120,6 +120,7 @@ def run_one(client: httpx.Client, base_url: str, scenario, name: str, tmp: Path,
         row["status"] = {0: "finished", 6: "gave_up"}.get(code, f"exit {code}")
         break
     goal = CampaignGoal()
+    client.post("/_admin/drain")  # whatever is still in flight lands (or is dropped) now
     effects = client.get("/_admin/effects", params={"run_id": run_id}).json()["effects"]
     row["check"] = check(effects, goal.expected_effects, goal.expected_spend)
     return row
@@ -138,8 +139,9 @@ def render(rows: list[dict], n: int, args, window: dict[str, float]) -> str:
         "config's own clean-run duration (measured first: "
         + ", ".join(f"`{k}` {v * 1000:.0f} ms" for k, v in window.items())
         + "), so kills land at a uniformly random point of the run. Kill timing is wall-clock, so "
-        "these numbers are not bit-for-bit reproducible. Faults and temperatures come from the "
-        "same seeded scenarios as results.md.",
+        "these numbers are not bit-for-bit reproducible. Faults (delayed delivery included, in "
+        "real seconds) and temperatures come from the same seeded scenarios as results.md; "
+        "deadlines are checked against the wall clock both processes share.",
         "",
     ]
     table = []
