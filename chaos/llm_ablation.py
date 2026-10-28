@@ -1,12 +1,15 @@
-"""Small real-LLM ablation: the Gemini planner in place of the scripted one.
+"""Real-LLM ablation: an LLM planner in place of the scripted one.
 
-    python -m chaos.llm_ablation --scenarios 6
+    python -m chaos.llm_ablation --scenarios 20                                   # Gemini
+    python -m chaos.llm_ablation --provider ollama --scenarios 50 --control       # local model
 
 Each scenario crashes once, after the result of a step between the first ad
 and the email, with light lost-ack faults. keys_only re-plans from the goal
-after the crash; the harness resumes from its journal. Small N, rate-limited
-API: this is a sanity check that the scripted results carry over to a real
-model, not a benchmark.
+after the crash; the harness resumes from its journal. With --control, the
+harness also runs each scenario with no faults and no crashes: any
+"duplicate" there is the model's own planning mistake, which separates
+model mistakes from recovery failures. Small N, slow or rate-limited models:
+a check that the scripted results carry over to real models, not a benchmark.
 """
 
 from __future__ import annotations
@@ -14,10 +17,11 @@ from __future__ import annotations
 import argparse
 import random
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from agents.campaign import campaign_tools
-from agents.llm_planner import gemini_factory
+from agents.llm_planner import PlannerError, gemini_factory, ollama_factory
 from chaos.bench import RESULTS, _git_sha, _pct, _table, update_readme
 from chaos.driver import Scenario, run_scenario
 from chaos.invariants import KINDS
@@ -25,6 +29,13 @@ from harness.runtime import CONFIGS
 from platform_sim.faults import FaultConfig
 
 ABLATION = ("keys_only", "harness")
+CONTROL = "harness, no faults or crashes"
+PROVIDERS = {  # provider -> (default model, output file / README block, how the model is reached)
+    "gemini": ("gemini-3.5-flash-lite", "llm", "Gemini function calling"),
+    "ollama": ("qwen2.5:3b", "llm_local", "Ollama tool calling, running locally on CPU (a reply "
+               "without a tool call ends the run, as in a standard agent loop, so goal steps the "
+               "model skips count as missing)"),
+}
 
 
 def scenarios(n: int, seed: int, temperature: float) -> list[Scenario]:
@@ -42,38 +53,53 @@ def scenarios(n: int, seed: int, temperature: float) -> list[Scenario]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument("--provider", choices=sorted(PROVIDERS), default="gemini")
+    parser.add_argument("--model", help="default: gemini-3.5-flash-lite / qwen2.5:3b")
     parser.add_argument("--scenarios", type=int, default=6)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--temperature", type=float, default=0.7)
-    parser.add_argument("--model", default="gemini-3.5-flash-lite")
-    parser.add_argument("--min-interval", type=float, default=4.0)
+    parser.add_argument("--min-interval", type=float, default=4.0, help="Gemini only: seconds between requests")
+    parser.add_argument("--control", action="store_true", help="also run the harness with no faults or crashes")
     parser.add_argument("--out", type=Path, default=RESULTS)
     args = parser.parse_args()
+    default_model, block, via = PROVIDERS[args.provider]
+    model = args.model or default_model
 
     tools = campaign_tools()
-    factory = gemini_factory(tools, args.model, min_interval=args.min_interval)
-    rows = []
+    factory = (gemini_factory(tools, model, min_interval=args.min_interval) if args.provider == "gemini"
+               else ollama_factory(tools, model))
+    configs = (*ABLATION, CONTROL) if args.control else ABLATION
+    rows, skipped = [], []
     stopped = None
     started = time.perf_counter()
     for scenario in scenarios(args.scenarios, args.seed, args.temperature):
-        pair = []
+        group = []
         try:
             for name in ABLATION:
-                pair.append(run_scenario(scenario, CONFIGS[name], tools=tools, planner_factory=factory))
-        except RuntimeError as exc:  # quota or availability: keep only complete pairs
-            stopped = f"stopped after {len(rows) // len(ABLATION)} scenarios: {str(exc)[:120]}"
+                group.append(run_scenario(scenario, CONFIGS[name], tools=tools, planner_factory=factory))
+            if args.control:
+                calm = replace(scenario, faults=FaultConfig(), crashes=())
+                report = run_scenario(calm, CONFIGS["harness"], tools=tools, planner_factory=factory)
+                report.config = CONTROL
+                group.append(report)
+        except PlannerError as exc:  # the model never made a tool call: skip, and say so
+            skipped.append(scenario.seed)
+            print(f"scenario {scenario.seed} skipped: {exc}", flush=True)
+            continue
+        except RuntimeError as exc:  # quota or availability: keep only complete groups
+            stopped = f"stopped after {len(rows) // len(configs)} scenarios: {str(exc)[:120]}"
             print(stopped, flush=True)
             break
-        rows += pair
-        for report in pair:
+        rows += group
+        for report in group:
             print(f"scenario {scenario.seed} {report.config}: {report.status}, "
                   f"dups {report.check.duplicates}, planner calls {report.planner_calls}", flush=True)
     if not rows:
         raise SystemExit(stopped or "no runs completed")
-    n = len(rows) // len(ABLATION)
+    n = len(rows) // len(configs)
 
     table = []
-    for name in ABLATION:
+    for name in configs:
         rs = [r for r in rows if r.config == name]
         table.append([
             f"`{name}`", len(rs), _pct(sum(r.finished for r in rs), len(rs)),
@@ -82,33 +108,40 @@ def main() -> None:
             sum(r.check.missing_total for r in rs if r.finished),
             f"{sum(r.planner_calls for r in rs) / len(rs):.1f}",
         ])
+    command = (f"python -m chaos.llm_ablation --provider {args.provider} --model {model} "
+               f"--scenarios {args.scenarios} --seed {args.seed}" + (" --control" if args.control else ""))
+    notes = []
+    if stopped:
+        notes.append(stopped)
+    if skipped:
+        notes.append(f"{len(skipped)} skipped because the model made no tool call: {skipped}")
     text = "\n".join([
         "# Real-LLM ablation (small N)",
         "",
-        f"Generated by `python -m chaos.llm_ablation --scenarios {args.scenarios} --seed {args.seed} "
-        f"--model {args.model}` at commit `{_git_sha()}`. Do not edit by hand.",
+        f"Generated by `{command}` at commit `{_git_sha()}`. Do not edit by hand.",
         "",
-        f"{n} scenarios x {len(ABLATION)} configs completed"
-        + (f" ({stopped})." if stopped else "."),
+        f"{n} scenarios x {len(configs)} configs completed" + (f" ({'; '.join(notes)})." if notes else "."),
         "",
-        f"Planner: `{args.model}` via Gemini function calling at temperature {args.temperature}, "
-        "deciding from the goal and observed history only. Every scenario crashes once after a "
-        "step between the first ad and the email (in-process crash injection), with 5% lost acks. "
-        "LLM output is not reproducible run to run, and N is small: a sanity check that the "
-        "scripted-planner results carry over, not a benchmark.",
+        f"Planner: `{model}` via {via}, at temperature {args.temperature}, deciding from the goal and "
+        "observed history only. Every scenario crashes once after a step between the first ad and "
+        "the email (in-process crash injection), with 5% lost acks. LLM output is not reproducible "
+        "run to run, and N is small: a check that the scripted-planner results carry over, not a "
+        "benchmark.",
         "",
         _table(["config", "runs", "finished", "runs with a duplicate", *(f"dup {k}" for k in KINDS),
                 "missing (finished runs)", "planner calls / run"], table),
         "",
         "A duplicate here can also be the model's own planning mistake (say, a fourth ad); the "
-        "invariant checker cannot tell the two apart and counts both.",
+        "invariant checker cannot tell the two apart and counts both."
+        + (f" The `{CONTROL}` row measures those mistakes alone: same scenarios, same model, "
+           "nothing to recover from." if args.control else ""),
         "",
     ])
     args.out.mkdir(parents=True, exist_ok=True)
-    (args.out / "llm.md").write_text(text, encoding="utf-8", newline="\n")
+    (args.out / f"{block}.md").write_text(text, encoding="utf-8", newline="\n")
     if args.out.resolve() == RESULTS:
-        update_readme("llm", text.split("\n", 2)[2].strip())
-    print(f"{len(rows)} runs in {time.perf_counter() - started:.0f}s -> {args.out / 'llm.md'}")
+        update_readme(block, text.split("\n", 2)[2].strip())
+    print(f"{len(rows)} runs in {time.perf_counter() - started:.0f}s -> {args.out / f'{block}.md'}")
 
 
 if __name__ == "__main__":

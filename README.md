@@ -197,6 +197,13 @@ Planner: `gemini-3.5-flash-lite` via Gemini function calling at temperature 0.7,
 A duplicate here can also be the model's own planning mistake (say, a fourth ad); the invariant checker cannot tell the two apart and counts both.
 <!-- llm:end -->
 
+### A local model at larger N
+
+The same comparison with a small open model running locally, which has no quota, plus a control row: the harness on the same scenarios with no faults and no crashes. Whatever the control row shows is the model's own planning, so the rows above it can be read as recovery alone.
+
+<!-- llm_local:start -->
+<!-- llm_local:end -->
+
 ## How it works
 
 ### Write order and crash windows
@@ -317,7 +324,7 @@ harness/       runtime.py      the loop, effect-class recovery, deadlines, fenci
                clock.py        real and virtual clocks shared with the simulator
                trace.py        python -m harness.trace: a run's journal as a timeline
 agents/        campaign.py     campaign tools, goal and scripted planner
-               llm_planner.py  Gemini function-calling planner behind the same interface
+               llm_planner.py  Gemini and Ollama planners behind the same interface
                __main__.py     python -m agents: the agent over real HTTP
 platform_sim/  app.py faults.py db.py __main__.py    FastAPI + SQLite simulator
 chaos/         driver.py       in-process crash/zombie driver and audit-log operator
@@ -326,7 +333,7 @@ chaos/         driver.py       in-process crash/zombie driver and audit-log oper
                bench.py        -> results/results.md
                sweep.py        fault-rate sweep -> results/sweep.md
                sigkill.py      separate processes, hard kills -> results/sigkill.md
-               llm_ablation.py -> results/llm.md
+               llm_ablation.py -> results/llm.md, results/llm_local.md
 tests/         platform, journal, errors, runtime, in-flight calls, crash matrix, baselines,
                Hypothesis properties
 results/       generated only, never hand-edited
@@ -370,7 +377,11 @@ python -m chaos.sigkill
 python -m chaos.llm_ablation
 ```
 
-`chaos.bench` writes `results/results.md`: 500 scenarios by 5 configs, the no-deadline ablation, and 200 zombie scenarios, a few minutes on a laptop. `chaos.sweep` writes `results/sweep.md`. `chaos.sigkill` writes `results/sigkill.md`. `chaos.llm_ablation` needs `GEMINI_API_KEY` and writes `results/llm.md`.
+```bash
+python -m chaos.llm_ablation --provider ollama --scenarios 50 --control
+```
+
+`chaos.bench` writes `results/results.md`: 500 scenarios by 5 configs, the no-deadline ablation, and 200 zombie scenarios, a few minutes on a laptop. `chaos.sweep` writes `results/sweep.md`. `chaos.sigkill` writes `results/sigkill.md`. `chaos.llm_ablation` needs `GEMINI_API_KEY` and writes `results/llm.md`. With `--provider ollama` it uses a local model (`ollama pull qwen2.5:3b`) and writes `results/llm_local.md`.
 
 To watch a crash and a resume by hand, start the platform in one terminal:
 

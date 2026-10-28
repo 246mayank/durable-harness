@@ -1,11 +1,12 @@
-"""A real-LLM planner (Gemini function calling) behind the same interface as ScriptedPlanner.
+"""Real-LLM planners behind the same interface as ScriptedPlanner.
 
 Each decision sends the goal plus the observed history and asks for exactly
 one tool call. The model has no other memory, so a restart without replay
 re-plans from scratch, and at temperature > 0 it writes new copy each time.
 
-Reads GEMINI_API_KEY from the environment and sends it only as a request
-header to Google's API.
+- GeminiPlanner: Gemini function calling. Reads GEMINI_API_KEY from the
+  environment and sends it only as a request header to Google's API.
+- OllamaPlanner: a local model through Ollama's chat API. No key, no quota.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from agents.campaign import CampaignGoal
 from harness.tools import ToolRegistry
 
 API = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+OLLAMA = "http://127.0.0.1:11434"
 
 SYSTEM = """You are a B2B marketing agent operating an ad and email platform through tools.
 
@@ -35,6 +37,35 @@ Then call finish.
 
 Call exactly one tool per turn. Use ids returned by earlier calls. If a call
 failed, decide from its error whether to retry it."""
+
+FINISH = {"name": "finish", "description": "Call when every goal step is done."}
+
+
+class PlannerError(RuntimeError):
+    """The model didn't produce a usable tool call."""
+
+
+def _system(goal: CampaignGoal) -> str:
+    return SYSTEM.format(product=goal.product, audience=goal.audience, n_ads=goal.n_ads,
+                         segment=goal.email_segment, initial=goal.initial_budget, boost=goal.boost)
+
+
+def _render(history: list[dict]) -> str:
+    if not history:
+        return "No tool calls yet. Make the first call."
+    lines = ["Tool calls so far, oldest first:"]
+    for h in history:
+        outcome = (f"ok -> {json.dumps(h['value'])}" if h["status"] == "ok"
+                   else f"FAILED ({h.get('error_class')}): {h.get('error')}")
+        lines.append(f"{h['step']}. {h['tool']}({json.dumps(h['args'])}) {outcome}")
+    lines.append("Make the next call.")
+    return "\n".join(lines)
+
+
+def _decision(name: str, args: dict | None, model: str) -> dict:
+    if name == "finish":
+        return {"finish": True, "note": model}
+    return {"tool": name, "args": {k: v for k, v in (args or {}).items() if v is not None}, "note": model}
 
 
 def _gemini_schema(schema: dict, defs: dict | None = None) -> dict:
@@ -55,6 +86,11 @@ def _gemini_schema(schema: dict, defs: dict | None = None) -> dict:
     return out
 
 
+def _declarations(tools: ToolRegistry) -> list[dict]:
+    return [{"name": t.name, "description": t.description,
+             "parameters": _gemini_schema(t.args.model_json_schema())} for t in tools.tools.values()]
+
+
 class GeminiPlanner:
     def __init__(
         self,
@@ -71,20 +107,14 @@ class GeminiPlanner:
         self.model = model
         self.min_interval = min_interval
         self.client = client or httpx.Client(timeout=60)
-        self.declarations = [
-            {"name": t.name, "description": t.description,
-             "parameters": _gemini_schema(t.args.model_json_schema())}
-            for t in tools.tools.values()
-        ] + [{"name": "finish", "description": "Call when every goal step is done."}]
+        self.declarations = _declarations(tools) + [FINISH]
         self._last_request = 0.0
 
     def decide(self, goal: CampaignGoal, history: list[dict]) -> dict:
         self.calls += 1
-        system = SYSTEM.format(product=goal.product, audience=goal.audience, n_ads=goal.n_ads,
-                               segment=goal.email_segment, initial=goal.initial_budget, boost=goal.boost)
         body = {
-            "systemInstruction": {"parts": [{"text": system}]},
-            "contents": [{"role": "user", "parts": [{"text": self._render(history)}]}],
+            "systemInstruction": {"parts": [{"text": _system(goal)}]},
+            "contents": [{"role": "user", "parts": [{"text": _render(history)}]}],
             "tools": [{"functionDeclarations": self.declarations}],
             "toolConfig": {"functionCallingConfig": {"mode": "ANY"}},
             "generationConfig": {
@@ -94,29 +124,14 @@ class GeminiPlanner:
             },
         }
         call = self._function_call(self._post(body))
-        if call["name"] == "finish":
-            return {"finish": True, "note": self.model}
-        args = {k: v for k, v in call.get("args", {}).items() if v is not None}
-        return {"tool": call["name"], "args": args, "note": self.model}
-
-    @staticmethod
-    def _render(history: list[dict]) -> str:
-        if not history:
-            return "No tool calls yet. Make the first call."
-        lines = ["Tool calls so far, oldest first:"]
-        for h in history:
-            outcome = (f"ok -> {json.dumps(h['value'])}" if h["status"] == "ok"
-                       else f"FAILED ({h.get('error_class')}): {h.get('error')}")
-            lines.append(f"{h['step']}. {h['tool']}({json.dumps(h['args'])}) {outcome}")
-        lines.append("Make the next call.")
-        return "\n".join(lines)
+        return _decision(call["name"], call.get("args"), self.model)
 
     @staticmethod
     def _function_call(response: dict) -> dict:
         for part in response["candidates"][0]["content"]["parts"]:
             if "functionCall" in part:
                 return part["functionCall"]
-        raise RuntimeError(f"no function call in response: {json.dumps(response)[:300]}")
+        raise PlannerError(f"no function call in response: {json.dumps(response)[:300]}")
 
     def _post(self, body: dict) -> dict:
         key = os.environ["GEMINI_API_KEY"]
@@ -140,7 +155,56 @@ class GeminiPlanner:
         raise RuntimeError("Gemini kept failing")
 
 
+class OllamaPlanner:
+    """The same prompt on a local model through Ollama's chat API with tools.
+
+    Ollama can't force a tool call. As in a standard tool-calling agent loop,
+    a reply without one is the model's final answer: the run finishes there,
+    and any goal step it skipped shows up as a missing effect.
+    """
+
+    def __init__(
+        self,
+        tools: ToolRegistry,
+        seed: int = 0,
+        temperature: float = 1.0,
+        model: str = "qwen2.5:3b",
+        base_url: str = OLLAMA,
+        client: httpx.Client | None = None,
+    ) -> None:
+        self.calls = 0
+        self.seed = seed
+        self.temperature = temperature
+        self.model = model
+        self.base_url = base_url
+        self.client = client or httpx.Client(timeout=600)
+        empty = {"type": "object", "properties": {}}
+        self.declarations = [{"type": "function", "function": d}
+                             for d in _declarations(tools) + [{**FINISH, "parameters": empty}]]
+
+    def decide(self, goal: CampaignGoal, history: list[dict]) -> dict:
+        self.calls += 1
+        messages = [{"role": "system", "content": _system(goal)},
+                    {"role": "user", "content": _render(history)}]
+        r = self.client.post(f"{self.base_url}/api/chat", json={
+            "model": self.model, "messages": messages, "tools": self.declarations, "stream": False,
+            "options": {"temperature": self.temperature, "seed": self.seed},
+        })
+        if r.status_code != 200:
+            raise RuntimeError(f"Ollama {r.status_code}: {r.text[:300]}")
+        calls = r.json()["message"].get("tool_calls") or []
+        if not calls:
+            return {"finish": True, "note": f"{self.model} (answered without a tool call)"}
+        return _decision(calls[0]["function"]["name"], calls[0]["function"].get("arguments"), self.model)
+
+
 def gemini_factory(tools: ToolRegistry, model: str = "gemini-3.5-flash", **kwargs: Any):
     """planner_factory(seed, temperature) for chaos.driver.run_scenario."""
     client = httpx.Client(timeout=60)
     return lambda seed, temperature: GeminiPlanner(tools, seed, temperature, model, client=client, **kwargs)
+
+
+def ollama_factory(tools: ToolRegistry, model: str = "qwen2.5:3b", **kwargs: Any):
+    """planner_factory(seed, temperature) for chaos.driver.run_scenario."""
+    client = httpx.Client(timeout=600)
+    return lambda seed, temperature: OllamaPlanner(tools, seed, temperature, model, client=client, **kwargs)
