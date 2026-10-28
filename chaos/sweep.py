@@ -72,6 +72,10 @@ def render(runs: dict[tuple[str, float], list[RunReport]], n: int, args) -> str:
         "Planner calls per run (9 for a clean run):",
         "",
         grid(lambda rs: f"{mean(r.planner_calls for r in rs):.1f}"),
+        "",
+        "Above 9 for the harness: a read that kept failing (metrics, or the conditional write's "
+        "precondition read) is reported to the planner, which plans that step again. Nothing had "
+        "been sent for it. The baselines re-plan from the goal after every crash.",
     ])
 
 

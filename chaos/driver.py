@@ -185,7 +185,9 @@ def escalation_causes(events: list, crashes: list[tuple[str, int]]) -> Counter:
             last = [x for x in events[:i] if x.kind == "attempt" and x.step == step][-1]
             cause = f"ambiguous reply ({last.payload['status']})"
         elif reason.startswith("outcome unknown"):
-            crash = next((c for c in crashes if c[1] == step), None)
+            # Only these crash points leave an intent without a result behind.
+            crash = next((c for c in crashes if c[1] == step and c[0] in ("after_intent", "after_send")),
+                         None)
             if crash:
                 crashes.remove(crash)
             cause = f"restart after a crash {crash[0]}" if crash else "restart"

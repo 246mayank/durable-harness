@@ -95,6 +95,14 @@ def test_crash_after_intent_on_unsafe_call_escalates_and_operator_voids():
     assert kinds == ["decision", "intent", "intent_voided", "intent", "attempt", "result"]
 
 
+def test_escalation_is_attributed_to_the_crash_that_left_the_intent():
+    # A crash after the decision leaves no intent; only the later one does.
+    crashes = {0: CrashAt("after_decision", step=ALLOCATE_STEP), 1: CrashAt("after_intent", step=ALLOCATE_STEP)}
+    report = run_scenario(Scenario(seed=4), HARNESS, hook_factory=crashes.get)
+    assert report.crashes == 2 and report.check.clean
+    assert report.escalation_causes == {("restart after a crash after_intent", "not applied"): 1}
+
+
 def test_ambiguous_idempotent_call_suspends_rather_than_replanning():
     config = replace(HARNESS, retries=0)
     suspended = 0
