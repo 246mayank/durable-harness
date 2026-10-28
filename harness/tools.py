@@ -34,13 +34,18 @@ class CallContext:
     # Captured once before the intent is written and journaled with it, so a
     # resumed step sends the same precondition (see conditional writes).
     precondition: dict | None = None
+    # Epoch seconds after which the platform must not process this call.
+    deadline: float | None = None
 
     @property
     def trace_id(self) -> str:
         return f"{self.run_id}/{self.step}"
 
     def headers(self) -> dict[str, str]:
-        return {"X-Run-Id": self.run_id, "X-Trace-Id": self.trace_id}
+        headers = {"X-Run-Id": self.run_id, "X-Trace-Id": self.trace_id}
+        if self.deadline is not None:
+            headers["X-Deadline"] = repr(self.deadline)
+        return headers
 
 
 Execute = Callable[[httpx.Client, Any, CallContext], Any]

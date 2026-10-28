@@ -2,7 +2,7 @@ import sqlite3
 
 import pytest
 
-from harness.journal import Journal
+from harness.journal import Fenced, Journal
 from harness.keys import KeyMode, make_key
 
 
@@ -87,3 +87,26 @@ def test_key_modes():
     assert p1 == p2  # ...positional keys follow the step
     assert p1 != make_key(KeyMode.POSITIONAL, "r", 4, "create_ad", {})
     assert p1 != make_key(KeyMode.POSITIONAL, "other-run", 3, "create_ad", {})
+
+
+def test_a_newer_epoch_fences_off_the_older_one(tmp_path):
+    path = tmp_path / "j.db"
+    with Journal(path) as old, Journal(path) as new:
+        first = old.acquire("r")
+        old.append("r", "incarnation", None, {"n": 1}, epoch=first)
+        second = new.acquire("r")
+        assert second == first + 1
+        with pytest.raises(Fenced):
+            old.append("r", "decision", 0, {"tool": "t", "args": {}}, epoch=first)
+        with pytest.raises(Fenced):
+            old.check_epoch("r", first)
+        new.append("r", "decision", 0, {"tool": "t", "args": {}}, epoch=second)
+        assert [e.kind for e in new.events("r")] == ["incarnation", "decision"]  # the fenced write left nothing
+
+
+def test_latest_deadline_is_folded_per_step():
+    j = Journal()
+    j.append("r", "decision", 0, {"tool": "t", "args": {}})
+    j.append("r", "intent", 0, {"tool": "t", "key": "k", "deadline": 10.0})
+    j.append("r", "deadline", 0, {"deadline": 12.5})
+    assert j.load_state("r").steps[0].deadline == 12.5

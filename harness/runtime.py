@@ -13,25 +13,42 @@ first step without a result:
 A decided step is never re-asked. The planner is consulted only when no step
 is in progress, so a resumed run makes exactly the calls it had decided on,
 with the same arguments and the same positional keys.
+
+Two more rules cover calls that may still be in flight:
+
+- Deadlines. Every send carries a deadline, journaled before the send, after
+  which the platform won't process it. A lookup that finds nothing proves
+  nothing while a send might still land, so recovery waits until the step's
+  latest deadline has passed before it trusts a negative lookup.
+- Fencing. Each incarnation takes the run over with a new epoch, and every
+  journal write and every send checks it. An incarnation that was presumed
+  dead and wakes up can't journal or send again; its only possible stray send
+  is one it had already passed the check for, and that send carries a
+  journaled deadline that the new owner waits out before it acts.
 """
 
 from __future__ import annotations
 
-import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 import httpx
 from pydantic import ValidationError
 
+from harness.clock import RealClock
 from harness.errors import Ambiguous, Rejected, ToolError, Unresolvable
-from harness.journal import Journal, RunState, StepState
+from harness.journal import Fenced, Journal, RunState, StepState
 from harness.keys import KeyMode, args_hash, make_key
 from harness.tools import CallContext, Effect, Tool, ToolRegistry
 
 CRASH_POINTS = ("after_decision", "after_intent", "after_send", "after_result")
+# Hooks also fire at "before_send", after the fence check and just before the request goes out.
+# It isn't a crash point (a crash there looks like after_intent), but it is the one gap a
+# presumed-dead incarnation can be frozen in and still send from when it wakes.
 MAX_STEPS = 40
+DEADLINE = 0.5  # seconds a send has to be processed; waited out before a negative lookup
+DEADLINE_MARGIN = 0.05  # slack for clock reads on either side
 
 CrashHook = Callable[[str, int], None]
 
@@ -56,10 +73,14 @@ class Config:
     effect_aware: bool
     approvals: bool = False
     budget_cap: int | None = None
+    deadline: float | None = None  # seconds; None sends no deadline and never waits
+    fencing: bool = False
 
     def __post_init__(self) -> None:
         if self.effect_aware and self.keys is KeyMode.NONE:
             raise ValueError("effect-aware recovery re-sends idempotent calls, so it needs keys")
+        if self.fencing and not self.replay:
+            raise ValueError("fencing guards a shared journal; without replay there is none")
 
 
 CONFIGS = {
@@ -68,14 +89,15 @@ CONFIGS = {
         Config("naive", replay=False, keys=KeyMode.NONE, retries=0, effect_aware=False),
         Config("naive_retry", replay=False, keys=KeyMode.NONE, retries=5, effect_aware=False),
         Config("keys_only", replay=False, keys=KeyMode.ARGS, retries=5, effect_aware=False),
-        Config("harness", replay=True, keys=KeyMode.POSITIONAL, retries=5, effect_aware=True),
+        Config("harness", replay=True, keys=KeyMode.POSITIONAL, retries=5, effect_aware=True,
+               deadline=DEADLINE, fencing=True),
     )
 }
 
 
 @dataclass(frozen=True)
 class Outcome:
-    """Why a run() call returned: finished, escalated, suspended, awaiting_approval or gave_up."""
+    """Why run() returned: finished, escalated, suspended, awaiting_approval, gave_up or fenced."""
 
     status: str
     detail: dict = field(default_factory=dict)
@@ -94,6 +116,7 @@ class Runtime:
         *,
         crash_hook: CrashHook | None = None,
         backoff: float = 0.0,
+        clock=None,
     ) -> None:
         # Without replay the log lives in memory only, so a restart loses it and
         # the agent starts again from the goal. That is the baseline under test.
@@ -103,12 +126,24 @@ class Runtime:
         self.config = config
         self.crash_hook = crash_hook
         self.backoff = backoff
+        self.clock = clock or RealClock()
+        self.epoch: int | None = None
 
     # ---- the loop -----------------------------------------------------------
 
     def run(self, run_id: str, goal: Any, planner: Planner) -> Outcome:
+        try:
+            return self._run(run_id, goal, planner)
+        except Fenced as exc:
+            # A newer incarnation owns the run. Journal nothing more; just stop.
+            return Outcome("fenced", {"epoch": exc.epoch, "current": exc.current})
+
+    def _run(self, run_id: str, goal: Any, planner: Planner) -> Outcome:
+        if self.config.fencing:
+            self.epoch = self.journal.acquire(run_id)  # before reading, so no older write is missed
         state = self.journal.load_state(run_id)
-        self._emit(state, "incarnation", None, {"n": state.incarnations + 1, "config": self.config.name})
+        self._emit(state, "incarnation", None, {"n": state.incarnations + 1, "config": self.config.name,
+                                                "epoch": self.epoch})
         if state.status["status"] in ("finished", "escalated", "awaiting_approval"):
             return Outcome(state.status["status"], state.status)
 
@@ -117,6 +152,7 @@ class Runtime:
             if step is None:
                 if len(state.steps) >= MAX_STEPS:
                     return self._stop(state, "gave_up", {"reason": "step limit"})
+                self._check_fence(state)  # don't pay for a planner call we couldn't journal
                 decision = planner.decide(goal, state.history())
                 step = self._emit(state, "decision", len(state.steps), decision)
                 self._hook("after_decision", step.index)
@@ -162,11 +198,12 @@ class Runtime:
                 precondition = self._read(lambda: tool.prepare(self.client, args, ctx))
             except ToolError as err:
                 return self._fail(state, step, err)
-            ctx = CallContext(ctx.run_id, ctx.step, ctx.key, precondition)
+            ctx = replace(ctx, precondition=precondition)
 
+        ctx = replace(ctx, deadline=self._new_deadline())
         self._emit(state, "intent", step.index, {
             "tool": tool.name, "args": arg_dict, "key": ctx.key,
-            "effect": tool.effect.value, "precondition": ctx.precondition,
+            "effect": tool.effect.value, "precondition": ctx.precondition, "deadline": ctx.deadline,
         })
         self._hook("after_intent", step.index)
         return self._send(state, step, tool, args, ctx)
@@ -181,7 +218,9 @@ class Runtime:
         last: ToolError | None = None
         for n in range(self.config.retries + 1):
             if n and self.backoff:
-                time.sleep(self.backoff * 2 ** (n - 1))
+                self.clock.sleep(self.backoff * 2 ** (n - 1))
+            ctx = self._before_send(state, step, ctx)
+            self._hook("before_send", step.index)
             try:
                 value = tool.execute(self.client, args, ctx)
             except ToolError as err:
@@ -214,7 +253,8 @@ class Runtime:
     def _recover(self, state: RunState, step: StepState, tool: Tool, args: Any) -> Outcome | None:
         """Resume a step whose intent was journaled but whose result was not."""
         intent = step.intent
-        ctx = CallContext(state.run_id, step.index, intent["key"], intent.get("precondition"))
+        ctx = CallContext(state.run_id, step.index, intent["key"], intent.get("precondition"),
+                          step.deadline)
         if not self.config.effect_aware or tool.effect in (Effect.READ, Effect.IDEMPOTENT):
             # Even if every re-send is now refused outright, the original may have
             # applied: the step stays in doubt and must not go back to the planner.
@@ -226,9 +266,15 @@ class Runtime:
 
     def _reconcile(self, state: RunState, step: StepState, tool: Tool, args: Any,
                    ctx: CallContext) -> Any:
-        """Look the effect up. Returns _ABSENT, None (recorded as done) or an Outcome."""
+        """Look the effect up. Returns _ABSENT, None (recorded as done) or an Outcome.
+
+        Finding nothing proves nothing while a send may still be in flight, so
+        first wait until no send of this step can be processed any more.
+        """
+        self._await_deadline(ctx.deadline)
         try:
-            found = self._read(lambda: tool.lookup(self.client, args, ctx))
+            read_ctx = replace(ctx, deadline=None)  # a read isn't bound by the write's deadline
+            found = self._read(lambda: tool.lookup(self.client, args, read_ctx))
         except ToolError:
             return self._stop(state, "suspended", {"step": step.index, "reason": "lookup failed"})
         except Unresolvable as exc:
@@ -248,7 +294,7 @@ class Runtime:
                 if n == self.config.retries:
                     raise
                 if self.backoff:
-                    time.sleep(self.backoff * 2 ** n)
+                    self.clock.sleep(self.backoff * 2 ** n)
 
     def _reserved_spend(self, state: RunState) -> int:
         """Committed spend plus spend whose outcome is still unknown."""
@@ -261,10 +307,31 @@ class Runtime:
                 total += tool.spend(tool.args.model_validate(s.intent["args"]))
         return total
 
+    # ---- deadlines and fencing ----------------------------------------------------
+
+    def _new_deadline(self) -> float | None:
+        return self.clock.now() + self.config.deadline if self.config.deadline else None
+
+    def _await_deadline(self, deadline: float | None) -> None:
+        if deadline is not None:
+            self.clock.sleep(deadline + DEADLINE_MARGIN - self.clock.now())
+
+    def _check_fence(self, state: RunState) -> None:
+        if self.epoch is not None:
+            self.journal.check_epoch(state.run_id, self.epoch)
+
+    def _before_send(self, state: RunState, step: StepState, ctx: CallContext) -> CallContext:
+        """Fence check, plus a fresh deadline (journaled first) once the current one has passed."""
+        self._check_fence(state)
+        if self.config.deadline and (ctx.deadline is None or self.clock.now() >= ctx.deadline):
+            ctx = replace(ctx, deadline=self._new_deadline())
+            self._emit(state, "deadline", step.index, {"deadline": ctx.deadline})
+        return ctx
+
     # ---- journaling helpers -----------------------------------------------------
 
     def _emit(self, state: RunState, kind: str, step: int | None, payload: dict) -> StepState | None:
-        state.apply(self.journal.append(state.run_id, kind, step, payload))
+        state.apply(self.journal.append(state.run_id, kind, step, payload, epoch=self.epoch))
         return state.steps[step] if step is not None else None
 
     def _hook(self, point: str, step: int) -> None:
@@ -286,7 +353,7 @@ class Runtime:
     def _escalate(self, state: RunState, step: StepState, ctx: CallContext, reason: str) -> Outcome:
         return self._stop(state, "escalated", {
             "step": step.index, "tool": step.decision["tool"], "args": step.decision["args"],
-            "trace_id": ctx.trace_id, "reason": reason,
+            "trace_id": ctx.trace_id, "reason": reason, "deadline": ctx.deadline,
         })
 
     def _stop(self, state: RunState, status: str, detail: dict) -> Outcome:

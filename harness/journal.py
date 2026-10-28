@@ -14,6 +14,12 @@ survives a process kill, because the committed frames are in the OS page
 cache, but the last few events can be lost on power failure, and a lost
 intent for a call that did go out is exactly the case the journal exists to
 prevent.
+
+Fencing: each incarnation that takes over a run calls `acquire`, which bumps
+the run's epoch, and passes its epoch to every `append`. An append from an
+older epoch fails with `Fenced` inside the same transaction, so a process
+that was presumed dead and wakes up can't journal anything: no new decision,
+no renewed deadline, no result.
 """
 
 from __future__ import annotations
@@ -27,7 +33,8 @@ from pathlib import Path
 from typing import Any
 
 KINDS = frozenset(
-    {"decision", "intent", "attempt", "result", "status", "incarnation", "intent_voided", "approval"}
+    {"decision", "intent", "attempt", "result", "status", "incarnation", "intent_voided", "approval",
+     "deadline"}
 )
 
 SCHEMA = """
@@ -40,7 +47,20 @@ CREATE TABLE IF NOT EXISTS events (
     ts      REAL    NOT NULL,
     PRIMARY KEY (run_id, seq)
 );
+CREATE TABLE IF NOT EXISTS leases (
+    run_id TEXT PRIMARY KEY,
+    epoch  INTEGER NOT NULL
+);
 """
+
+
+class Fenced(Exception):
+    """A newer incarnation has taken this run over; the caller must stop."""
+
+    def __init__(self, run_id: str, epoch: int, current: int) -> None:
+        super().__init__(f"run {run_id}: epoch {epoch} fenced off by epoch {current}")
+        self.epoch = epoch
+        self.current = current
 
 
 @dataclass(frozen=True)
@@ -62,6 +82,8 @@ class StepState:
     result: dict | None = None
     voided: int = 0
     approved_hash: str | None = None
+    # Latest deadline any send of this step carried; nothing can land after it.
+    deadline: float | None = None
 
     @property
     def done(self) -> bool:
@@ -89,6 +111,9 @@ class RunState:
             step = self.steps[event.step]
             if kind == "intent":
                 step.intent = p
+                step.deadline = p.get("deadline")
+            elif kind == "deadline":
+                step.deadline = p["deadline"]
             elif kind == "attempt":
                 step.attempts.append(p)
             elif kind == "result":
@@ -132,7 +157,38 @@ class Journal:
         self._conn.execute(f"PRAGMA synchronous={durability.upper()}")
         self._conn.executescript(SCHEMA)
 
-    def append(self, run_id: str, kind: str, step: int | None, payload: dict[str, Any]) -> Event:
+    def acquire(self, run_id: str) -> int:
+        """Take a run over: returns a new epoch, and every older epoch is fenced off."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    "INSERT INTO leases (run_id, epoch) VALUES (?, 1)"
+                    " ON CONFLICT(run_id) DO UPDATE SET epoch = epoch + 1",
+                    (run_id,),
+                )
+                (epoch,) = self._conn.execute(
+                    "SELECT epoch FROM leases WHERE run_id = ?", (run_id,)).fetchone()
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+            self._conn.execute("COMMIT")
+        return epoch
+
+    def check_epoch(self, run_id: str, epoch: int) -> None:
+        """Raise Fenced unless `epoch` still owns the run."""
+        with self._lock:
+            self._check_epoch(run_id, epoch)
+
+    def _check_epoch(self, run_id: str, epoch: int) -> None:
+        row = self._conn.execute("SELECT epoch FROM leases WHERE run_id = ?", (run_id,)).fetchone()
+        current = row[0] if row else 0
+        if current != epoch:
+            raise Fenced(run_id, epoch, current)
+
+    def append(self, run_id: str, kind: str, step: int | None, payload: dict[str, Any],
+               epoch: int | None = None) -> Event:
+        """Commit one event. With `epoch`, only if that epoch still owns the run."""
         if kind not in KINDS:
             raise ValueError(f"unknown event kind {kind!r}")
         body = json.dumps(payload, sort_keys=True)
@@ -140,6 +196,8 @@ class Journal:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                if epoch is not None:
+                    self._check_epoch(run_id, epoch)
                 (seq,) = self._conn.execute(
                     "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE run_id = ?", (run_id,)
                 ).fetchone()

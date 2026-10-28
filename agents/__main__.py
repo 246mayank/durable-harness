@@ -6,7 +6,8 @@
     python -m agents resolve --run-id demo --from-audit        # if it escalated
     python -m harness.trace runs/journal.db demo
 
-Exit codes: 0 finished, 3 escalated, 4 suspended, 5 awaiting approval, 6 gave up.
+Exit codes: 0 finished, 3 escalated, 4 suspended, 5 awaiting approval, 6 gave up,
+7 fenced (a newer incarnation owns the run).
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from agents.campaign import CampaignGoal, ScriptedPlanner, campaign_tools
 from harness.journal import Journal
 from harness.runtime import CONFIGS, Runtime, approve, resolve
 
-EXIT = {"finished": 0, "escalated": 3, "suspended": 4, "awaiting_approval": 5, "gave_up": 6}
+EXIT = {"finished": 0, "escalated": 3, "suspended": 4, "awaiting_approval": 5, "gave_up": 6, "fenced": 7}
 
 
 def die_at(spec: str):

@@ -26,6 +26,7 @@ def test_success_returns_json():
     "status, error",
     [
         (429, NotApplied),
+        (408, NotApplied),
         (500, Ambiguous),
         (502, Ambiguous),
         (503, Ambiguous),

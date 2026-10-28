@@ -1,7 +1,8 @@
 from fastapi.testclient import TestClient
 
+from harness.clock import VirtualClock
 from platform_sim.app import create_app
-from platform_sim.faults import FaultConfig
+from platform_sim.faults import Fault, FaultConfig
 
 CAMPAIGN = {"name": "Q4 launch", "product": "Ledgerly", "audience": "CFOs"}
 
@@ -126,3 +127,47 @@ def test_effects_are_attributed_to_run_and_trace():
     c.post("/v1/campaigns", json=CAMPAIGN, headers={"X-Run-Id": "r2"})
     rows = c.get("/_admin/effects", params={"run_id": "r1"}).json()["effects"]
     assert [(e["run_id"], e["trace_id"]) for e in rows] == [("r1", "r1/0")]
+
+
+# ---- delayed delivery and deadlines ------------------------------------------------
+
+EMAIL = {"segment": "trial_users", "subject": "s", "body": "b", "client_ref": "ref-1"}
+
+
+def delayed(delay: float):
+    clock = VirtualClock()
+    c = TestClient(create_app(clock=clock))
+    c.app.state.platform.faults.force(Fault.DELAYED, delay=delay)
+    return c, clock
+
+
+def test_delayed_request_answers_504_and_commits_when_due():
+    c, clock = delayed(0.5)
+    assert c.post("/v1/email/batches", json=EMAIL).status_code == 504
+    assert c.get("/v1/email/batches", params={"client_ref": "ref-1"}).json()["items"] == []
+    clock.sleep(0.6)
+    # Processed ahead of the next request, so the lookup now finds it.
+    assert len(c.get("/v1/email/batches", params={"client_ref": "ref-1"}).json()["items"]) == 1
+
+
+def test_drain_processes_everything_still_in_flight():
+    c, clock = delayed(100.0)
+    c.post("/v1/email/batches", json=EMAIL)
+    assert effects(c) == []
+    assert c.post("/_admin/drain").json() == {"delivered": 1, "dropped": 0}
+    assert len(effects(c, "email_batch")) == 1
+
+
+def test_delayed_request_past_its_deadline_is_dropped():
+    c, clock = delayed(0.5)
+    c.post("/v1/email/batches", json=EMAIL, headers={"X-Deadline": str(clock.now() + 0.2)})
+    assert c.post("/_admin/drain").json() == {"delivered": 0, "dropped": 1}
+    assert effects(c) == []
+
+
+def test_request_arriving_after_its_deadline_gets_408():
+    clock = VirtualClock()
+    c = TestClient(create_app(clock=clock))
+    r = c.post("/v1/email/batches", json=EMAIL, headers={"X-Deadline": str(clock.now() - 1)})
+    assert r.status_code == 408
+    assert effects(c) == []

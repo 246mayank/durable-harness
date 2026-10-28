@@ -1,6 +1,7 @@
 """Failure taxonomy, classified by what the caller knows, not what the server did.
 
-    NotApplied  definitely not processed (connection refused, 429)   -> always safe to retry
+    NotApplied  definitely not processed (connection refused, 429,   -> always safe to retry
+                408 deadline exceeded)
     Ambiguous   may have taken effect (5xx, 504, timeout, reset)     -> recover by effect class
     Rejected    processed and refused (other 4xx)                    -> don't retry; tell the planner
 
@@ -55,7 +56,7 @@ _NOT_SENT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 def classify_status(status: int) -> type[ToolError] | None:
     if status < 400:
         return None
-    if status == 429:
+    if status in (408, 429):  # 408: the platform refused it unprocessed, past its deadline
         return NotApplied
     if status >= 500:
         return Ambiguous

@@ -1,4 +1,8 @@
-"""Property-based crash schedules: the harness's safety invariants hold for any of them."""
+"""Property-based crash schedules: the harness's safety invariants hold for any of them.
+
+Schedules mix network faults (delayed delivery included), crashes, and a first
+incarnation that may hang and come back as a zombie after the run is over.
+"""
 
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
@@ -13,9 +17,10 @@ scenarios = st.builds(
     Scenario,
     seed=st.integers(0, 10_000),
     faults=st.builds(FaultConfig, p_429=probability, p_5xx=probability, p_lost_ack=probability,
-                     seed=st.integers(0, 2**31 - 1)),
+                     p_delayed=probability, seed=st.integers(0, 2**31 - 1)),
     crashes=st.lists(st.tuples(st.sampled_from(CRASH_POINTS), st.integers(1, 10)), max_size=4).map(tuple),
     temperature=st.sampled_from([0.0, 0.3, 0.7, 1.0]),
+    freeze=st.none() | st.tuples(st.sampled_from((*CRASH_POINTS, "before_send")), st.integers(1, 10)),
 )
 
 
@@ -30,4 +35,7 @@ def test_harness_never_duplicates_or_overspends(scenario, conditional_writes):
     if report.finished:
         assert report.check.missing_total == 0
     # The planner is asked exactly once per journaled decision: never re-asked.
+    # (A fenced zombie checks its fence before asking, so it never adds an unjournaled call.)
     assert report.planner_calls == sum(1 for e in report.events if e.kind == "decision")
+    if report.froze:
+        assert report.zombie == "fenced"

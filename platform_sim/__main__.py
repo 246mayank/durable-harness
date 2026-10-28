@@ -21,9 +21,12 @@ def main() -> None:
     parser.add_argument("--p-429", type=float, default=0.0)
     parser.add_argument("--p-5xx", type=float, default=0.0)
     parser.add_argument("--p-lost-ack", type=float, default=0.0)
+    parser.add_argument("--p-delayed", type=float, default=0.0)
+    parser.add_argument("--max-delay", type=float, default=1.0, help="seconds a delayed request stays in flight")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
-    faults = FaultConfig(args.p_429, args.p_5xx, args.p_lost_ack, args.seed)
+    faults = FaultConfig(p_429=args.p_429, p_5xx=args.p_5xx, p_lost_ack=args.p_lost_ack,
+                         p_delayed=args.p_delayed, max_delay=args.max_delay, seed=args.seed)
     uvicorn.run(create_app(args.db, faults), host=args.host, port=args.port, log_level="warning")
 
 

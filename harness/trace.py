@@ -25,7 +25,8 @@ def format_event(e: Event) -> str:
     p = e.payload
     step = f"step {e.step:<2}" if e.step is not None else "       "
     if e.kind == "incarnation":
-        return f"-- incarnation {p.get('n')} ({p.get('config')}) " + "-" * 30
+        epoch = f", epoch {p['epoch']}" if p.get("epoch") else ""
+        return f"-- incarnation {p.get('n')} ({p.get('config')}{epoch}) " + "-" * 30
     if e.kind == "status":
         detail = {k: v for k, v in p.items() if k not in ("status", "args")}
         return f"   == {p['status']} {_short(detail, 90) if detail else ''}"
@@ -46,6 +47,8 @@ def format_event(e: Event) -> str:
         return f"{step} voided   {p.get('reason')}"
     if e.kind == "approval":
         return f"{step} approved args_hash={p['args_hash'][:10]}"
+    if e.kind == "deadline":
+        return f"{step} renewed  deadline (the last one passed before this send)"
     return f"{step} {e.kind} {_short(p)}"
 
 

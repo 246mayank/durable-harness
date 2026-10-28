@@ -9,14 +9,17 @@ The endpoints cover all four effect classes the harness distinguishes:
     POST /v1/campaigns/{id}/allocations   unsafe       (no key, no lookup)
     GET  /v1/campaigns/{id}/metrics       read
 
-Admin endpoints under /_admin are never faulted.
+Admin endpoints under /_admin are never faulted. POST /_admin/drain processes
+every request still in flight (see FaultMiddleware).
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import time
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from fastapi import FastAPI, Header, Request
 from fastapi.responses import JSONResponse
@@ -64,12 +67,47 @@ def _canonical_hash(path: str, body: dict) -> str:
     return hashlib.sha256(json.dumps([path, body], sort_keys=True).encode()).hexdigest()
 
 
+TICK = 0.01  # simulated seconds each request takes, when the clock is virtual
+
+
+@dataclass
+class InFlight:
+    """A delayed request: answered with a 504, processed when `due`."""
+
+    due: float
+    deadline: float | None
+    scope: dict
+    body: bytes
+
+
+def _headers(scope) -> dict[str, str]:
+    return {k.decode().lower(): v.decode() for k, v in scope["headers"]}
+
+
+async def _read_body(receive) -> bytes:
+    chunks = []
+    while True:
+        message = await receive()
+        chunks.append(message.get("body", b""))
+        if not message.get("more_body"):
+            return b"".join(chunks)
+
+
 class FaultMiddleware:
     """Pure-ASGI middleware applying one fault roll per non-admin request.
 
     429 and 5xx short-circuit before the endpoint runs, so nothing commits.
     A lost ack runs the endpoint to completion (it commits) and then replaces
-    the response with a 504.
+    the response with a 504. A delayed request gets a 504 at once but stays
+    in flight; it is processed once its delay is up, ahead of whichever
+    request comes next (admin reads included), so every observation sees it
+    in order. `/_admin/drain` processes everything still in flight.
+
+    Deadlines: a request may carry `X-Deadline` (epoch seconds on the clock
+    both sides share). The platform won't process a request after its
+    deadline: a direct one gets a 408, a delayed one is dropped. The check
+    runs when processing starts, which here is also when it commits; a real
+    platform would have to make it part of the commit.
     """
 
     def __init__(self, app, platform: "Platform") -> None:
@@ -77,14 +115,33 @@ class FaultMiddleware:
         self.platform = platform
 
     async def __call__(self, scope, receive, send) -> None:
-        if scope["type"] != "http" or scope["path"].startswith("/_admin"):
+        if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
+        if scope["path"] == "/_admin/drain":
+            await JSONResponse(await self._deliver(until=None))(scope, receive, send)
+            return
+        await self._deliver(until=self.platform.now())
+        if scope["path"].startswith("/_admin"):
+            await self.app(scope, receive, send)
+            return
+
+        self.platform.tick()
+        headers = _headers(scope)
+        deadline = float(headers["x-deadline"]) if "x-deadline" in headers else None
         fault, status = self.platform.faults.roll()
         handler_status = None
         if fault in (Fault.RATE_LIMIT, Fault.SERVER_ERROR):
             extra = {"Retry-After": "0"} if status == 429 else None
             await JSONResponse({"error": fault.value}, status, headers=extra)(scope, receive, send)
+        elif fault is Fault.DELAYED:
+            due = self.platform.now() + self.platform.faults.delay()
+            self.platform.in_flight.append(InFlight(due, deadline, dict(scope), await _read_body(receive)))
+            await JSONResponse({"error": "gateway timeout"}, 504)(scope, receive, send)
+        elif deadline is not None and self.platform.now() > deadline:
+            status = 408
+            await JSONResponse({"error": "deadline_exceeded", "deadline": deadline}, 408)(
+                scope, receive, send)
         else:
 
             async def forward(message) -> None:
@@ -99,25 +156,69 @@ class FaultMiddleware:
                 await JSONResponse({"error": "gateway timeout"}, 504)(scope, receive, send)
             else:
                 status = handler_status
-        headers = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
-        self.platform.log_request(
-            scope["method"], scope["path"], headers.get("x-run-id"), headers.get("x-trace-id"),
-            fault, handler_status, status,
-        )
+        self.platform.log_request(scope["method"], scope["path"], headers.get("x-run-id"),
+                                  headers.get("x-trace-id"), fault.value, handler_status, status)
+
+    async def _deliver(self, until: float | None) -> dict:
+        """Process in-flight requests due by `until` (all of them if None), oldest first."""
+        flights = self.platform.in_flight
+        due = sorted((f for f in flights if until is None or f.due <= until), key=lambda f: f.due)
+        for f in due:  # taken out before any await, so a concurrent caller can't take it too
+            flights.remove(f)
+        counts = {"delivered": 0, "dropped": 0}
+        for f in due:
+            self.platform.advance_to(f.due)
+            headers = _headers(f.scope)
+            if f.deadline is not None and f.due > f.deadline:
+                counts["dropped"] += 1
+                self.platform.log_request(f.scope["method"], f.scope["path"], headers.get("x-run-id"),
+                                          headers.get("x-trace-id"), "delayed:dropped", None, None)
+                continue
+            handler_status = None
+
+            async def receive(body=f.body):
+                return {"type": "http.request", "body": body, "more_body": False}
+
+            async def discard(message) -> None:
+                nonlocal handler_status
+                if message["type"] == "http.response.start":
+                    handler_status = message["status"]
+
+            await self.app(f.scope, receive, discard)
+            counts["delivered"] += 1
+            self.platform.log_request(f.scope["method"], f.scope["path"], headers.get("x-run-id"),
+                                      headers.get("x-trace-id"), "delayed:delivered", handler_status,
+                                      None)
+        return counts
 
 
 class Platform:
-    def __init__(self, db_path: str = ":memory:", faults: FaultConfig | None = None) -> None:
+    def __init__(self, db_path: str = ":memory:", faults: FaultConfig | None = None,
+                 clock=None) -> None:
         self.db = PlatformDB(db_path)
         self.faults = FaultInjector(faults)
+        # A shared VirtualClock in-process; wall-clock time when run as a server.
+        self.clock = clock
+        self.in_flight: list[InFlight] = []
 
-    def log_request(self, method, path, run_id, trace_id, fault: Fault,
+    def now(self) -> float:
+        return self.clock.now() if self.clock else time.time()
+
+    def tick(self) -> None:
+        if self.clock:
+            self.clock.sleep(TICK)
+
+    def advance_to(self, t: float) -> None:
+        if self.clock:
+            self.clock.advance_to(t)
+
+    def log_request(self, method, path, run_id, trace_id, fault: str,
                     handler_status: int | None, status: int | None) -> None:
         with self.db.tx() as conn:
             conn.execute(
                 "INSERT INTO requests (method, path, run_id, trace_id, fault, handler_status, status)"
                 " VALUES (?,?,?,?,?,?,?)",
-                (method, path, run_id, trace_id, fault.value, handler_status, status),
+                (method, path, run_id, trace_id, fault, handler_status, status),
             )
 
     def idempotent(
@@ -177,8 +278,8 @@ def _not_found(campaign_id: str) -> tuple[int, dict]:
     return 404, {"error": "campaign_not_found", "campaign_id": campaign_id}
 
 
-def create_app(db_path: str = ":memory:", faults: FaultConfig | None = None) -> FastAPI:
-    platform = Platform(db_path, faults)
+def create_app(db_path: str = ":memory:", faults: FaultConfig | None = None, clock=None) -> FastAPI:
+    platform = Platform(db_path, faults, clock)
     app = FastAPI(title="platform_sim")
     app.state.platform = platform
     app.add_middleware(FaultMiddleware, platform=platform)
@@ -336,6 +437,7 @@ def create_app(db_path: str = ":memory:", faults: FaultConfig | None = None) -> 
     @app.post("/_admin/reset")
     def reset(config: dict | None = None):
         platform.db.reset()
+        platform.in_flight.clear()
         platform.faults.configure(FaultConfig(**(config or {})))
         return {"ok": True}
 

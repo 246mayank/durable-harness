@@ -80,6 +80,7 @@ def test_crash_after_send_on_unsafe_call_escalates_and_operator_confirms():
                           keep_events=True)
     assert report.finished and report.check.clean
     assert report.escalations == 1
+    assert report.escalation_causes == {("restart after a crash after_send", "applied"): 1}
     results = [e for e in report.events if e.kind == "result" and e.step == ALLOCATE_STEP]
     assert [r.payload["via"] for r in results] == ["operator"]
 
@@ -89,6 +90,7 @@ def test_crash_after_intent_on_unsafe_call_escalates_and_operator_voids():
                           keep_events=True)
     assert report.finished and report.check.clean
     assert report.escalations == 1
+    assert report.escalation_causes == {("restart after a crash after_intent", "not applied"): 1}
     kinds = [e.kind for e in report.events if e.step == ALLOCATE_STEP]
     assert kinds == ["decision", "intent", "intent_voided", "intent", "attempt", "result"]
 
