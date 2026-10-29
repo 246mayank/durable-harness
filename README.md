@@ -267,6 +267,16 @@ Planner: `qwen2.5:3b` via Ollama tool calling, running locally on CPU (a reply w
 A duplicate here can also be the model's own planning mistake (say, a fourth ad). `steps applied twice` tells the two apart: it counts effects from a step that had already taken effect, which only a re-send can cause. Any other duplicate is a new step the model decided. Without a journal to replay, `keys_only` numbers its steps from 0 again after a crash, so the column doesn't apply to it. The `harness, no faults or crashes` row measures the model's mistakes alone: same scenarios, same model, nothing to recover from.
 <!-- llm_local:end -->
 
+### Real LLMs with parallel tool calls
+
+The same two comparisons, with each model allowed to return several tool calls per reply (`--parallel`). The harness journals such a reply as one decision of several calls (see [parallel tool calls](#parallel-tool-calls-1) below). The last column shows how much of each model's work actually came in multi-call replies.
+
+<!-- llm_parallel:start -->
+<!-- llm_parallel:end -->
+
+<!-- llm_local_parallel:start -->
+<!-- llm_local_parallel:end -->
+
 ## How it works
 
 ### Write order and crash windows
