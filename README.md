@@ -165,6 +165,13 @@ Planner calls per run (9 for a clean run):
 Above 9 for the harness: a read that kept failing (metrics, or the conditional write's precondition read) is reported to the planner, which plans that step again. Nothing had been sent for it. The baselines re-plan from the goal after every crash.
 <!-- sweep:end -->
 
+### Every crash schedule
+
+The benchmark samples crash schedules at random. This section enumerates them instead: every schedule of up to two crashes for every config, and of three for the harness.
+
+<!-- exhaustive:start -->
+<!-- exhaustive:end -->
+
 ### Hard process kills
 
 The main benchmark crashes in-process. This one kills real processes.
@@ -360,6 +367,7 @@ chaos/         driver.py       in-process crash/zombie driver and audit-log oper
                bench.py        -> results/results.md
                sweep.py        fault-rate sweep -> results/sweep.md
                sigkill.py      separate processes, hard kills -> results/sigkill.md
+               exhaustive.py   every crash schedule of up to 3 crashes -> results/exhaustive.md
                overhead.py     the journal's time per tool call -> results/overhead.md
                llm_ablation.py -> results/llm.md, results/llm_local.md
 tests/         platform, journal, errors, runtime, in-flight calls, crash matrix, baselines,
@@ -403,6 +411,10 @@ python -m chaos.sigkill
 ```
 
 ```bash
+python -m chaos.exhaustive
+```
+
+```bash
 python -m chaos.overhead
 ```
 
@@ -414,7 +426,7 @@ python -m chaos.llm_ablation
 python -m chaos.llm_ablation --provider ollama --scenarios 50 --control
 ```
 
-`chaos.bench` writes `results/results.md`: 500 scenarios by 5 configs, the no-deadline ablation, and 200 zombie scenarios, a few minutes on a laptop. `chaos.sweep` writes `results/sweep.md`. `chaos.sigkill` writes `results/sigkill.md`. `chaos.overhead` times the journal at each durability level and writes `results/overhead.md`. `chaos.llm_ablation` needs `GEMINI_API_KEY` and writes `results/llm.md`. With `--provider ollama` it uses a local model (`ollama pull qwen2.5:3b`) and writes `results/llm_local.md`.
+`chaos.bench` writes `results/results.md`: 500 scenarios by 5 configs, the no-deadline ablation, and 200 zombie scenarios, a few minutes on a laptop. `chaos.sweep` writes `results/sweep.md`. `chaos.sigkill` writes `results/sigkill.md`. `chaos.exhaustive` runs every crash schedule, about 20 minutes on 20 cores, and writes `results/exhaustive.md`. `chaos.overhead` times the journal at each durability level and writes `results/overhead.md`. `chaos.llm_ablation` needs `GEMINI_API_KEY` and writes `results/llm.md`. With `--provider ollama` it uses a local model (`ollama pull qwen2.5:3b`) and writes `results/llm_local.md`.
 
 To watch a crash and a resume by hand, start the platform in one terminal:
 

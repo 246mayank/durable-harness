@@ -1,11 +1,22 @@
 """Crash at every point x every step: the harness must be correct every time."""
 
+import math
+
 import pytest
 
 from chaos.driver import CrashAt, Scenario, run_scenario
+from chaos.exhaustive import schedules
 from harness.runtime import CONFIGS, CRASH_POINTS
 
 STEPS = range(9)  # 8 tool calls + finish
+
+
+def test_exhaustive_schedules_cover_every_combination():
+    assert len(schedules(2)) == (len(CRASH_POINTS) * len(STEPS)) ** 2
+    three = schedules(3, monotone=True)
+    assert all(a[1] <= b[1] <= c[1] for a, b, c in three)
+    # every non-decreasing step triple, at any crash points
+    assert len(three) == len(CRASH_POINTS) ** 3 * math.comb(len(STEPS) + 2, 3)
 
 
 @pytest.mark.parametrize("temperature", [0.0, 0.7])
