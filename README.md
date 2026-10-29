@@ -536,7 +536,7 @@ python -m chaos.llm_ablation
 python -m chaos.llm_ablation --provider ollama --scenarios 50 --control
 ```
 
-`chaos.bench` writes `results/results.md`: 500 scenarios by 5 configs, the no-deadline ablation, and 200 zombie scenarios, a few minutes on a laptop. `chaos.sweep` writes `results/sweep.md`. `chaos.sigkill` writes `results/sigkill.md`. `chaos.exhaustive` runs every crash schedule, about 20 minutes on 20 cores, and writes `results/exhaustive.md`. `chaos.overhead` times the journal at each durability level and writes `results/overhead.md`. `chaos.llm_ablation` needs `GEMINI_API_KEY` and writes `results/llm.md`. With `--provider ollama` it uses a local model (`ollama pull qwen2.5:3b`) and writes `results/llm_local.md`. `--parallel` lets the model return several calls per reply and adds `_parallel` to the file name.
+`chaos.bench` writes `results/results.md`: 500 scenarios by 5 configs, the no-deadline ablation, and 200 zombie scenarios, a few minutes on a laptop. `chaos.sweep` writes `results/sweep.md`. `chaos.sigkill` writes `results/sigkill.md`. `chaos.exhaustive` runs every crash schedule, about 50 minutes on 20 cores, and writes `results/exhaustive.md`. `chaos.overhead` times the journal at each durability level and writes `results/overhead.md`. `chaos.llm_ablation` needs `GEMINI_API_KEY` and writes `results/llm.md`. With `--provider ollama` it uses a local model (`ollama pull qwen2.5:3b`) and writes `results/llm_local.md`. `--parallel` lets the model return several calls per reply and adds `_parallel` to the file name.
 
 To watch a crash and a resume by hand, start the platform in one terminal:
 
