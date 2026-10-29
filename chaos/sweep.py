@@ -23,6 +23,7 @@ from agents.campaign import campaign_tools
 from chaos.bench import RESULTS, VARIANTS, _git_sha, _table, update_readme
 from chaos.driver import RunReport, Scenario, run_scenario
 from chaos.scenarios import generate
+from harness.journal import DURABILITY
 
 LEVELS = (0.0, 0.1, 0.2, 0.4, 0.6, 0.8)
 CONFIGS = ["naive_retry", "keys_only", "harness", "harness_cas"]
@@ -83,7 +84,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("--scenarios", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--durability", choices=("full", "normal"), default="full")
+    parser.add_argument("--durability", choices=sorted(DURABILITY), default="send")
     parser.add_argument("--workers", type=int, default=os.cpu_count() or 1)
     parser.add_argument("--out", type=Path, default=RESULTS)
     args = parser.parse_args()

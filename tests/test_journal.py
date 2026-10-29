@@ -56,7 +56,7 @@ def test_rejects_unknown_kinds_and_out_of_order_decisions():
         j.load_state("r")
 
 
-@pytest.mark.parametrize("durability, level", [("full", 2), ("normal", 1)])
+@pytest.mark.parametrize("durability, level", [("full", 2), ("send", 1), ("normal", 1)])
 def test_durability_sets_synchronous(tmp_path, durability, level):
     with Journal(tmp_path / "j.db", durability):
         pass
@@ -64,6 +64,30 @@ def test_durability_sets_synchronous(tmp_path, durability, level):
     assert j._conn.execute("PRAGMA synchronous").fetchone()[0] == level
     assert j._conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     j.close()
+
+
+STEP_WRITES = ["decision", "intent", "attempt", "deadline", "attempt", "result"]
+
+
+@pytest.mark.parametrize("durability, synced", [
+    ("send", {"intent", "deadline"}),  # the default: only the writes a send depends on
+    ("full", set(STEP_WRITES)),
+    ("normal", set()),
+])
+def test_durability_decides_which_writes_fsync(tmp_path, durability, synced):
+    with Journal(tmp_path / "j.db", durability) as j:
+        j.acquire("r")
+        for kind in STEP_WRITES:
+            before = j.fsyncs
+            j.append("r", kind, 0, {})
+            assert j.fsyncs - before == (kind in synced), kind
+            level = j._conn.execute("PRAGMA synchronous").fetchone()[0]
+            assert level == (2 if kind in synced else 1), kind
+
+
+def test_send_is_the_default_durability(tmp_path):
+    with Journal(tmp_path / "j.db") as j:
+        assert j.durability == "send"
 
 
 def test_appends_are_committed_immediately(tmp_path):

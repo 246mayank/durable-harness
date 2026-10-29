@@ -207,7 +207,7 @@ def run_scenario(
     tools: ToolRegistry | None = None,
     goal: CampaignGoal = CampaignGoal(),
     journal_dir: str | Path | None = None,
-    durability: str = "full",
+    durability: str = "send",
     hook_factory: Callable[[int], Callable | None] | None = None,
     operator: Callable = audit_operator,
     keep_events: bool = False,

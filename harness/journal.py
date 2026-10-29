@@ -7,13 +7,21 @@ Per step, events are written in the order
 Each event is its own committed transaction, so once `append` returns the
 event survives a process kill.
 
-Durability: `synchronous=FULL` (the default) fsyncs the WAL on every commit,
-so an intent is on disk before the call it describes goes out, even across
-an OS crash or power loss. `synchronous=NORMAL` skips that fsync. It still
-survives a process kill, because the committed frames are in the OS page
-cache, but the last few events can be lost on power failure, and a lost
-intent for a call that did go out is exactly the case the journal exists to
-prevent.
+Durability, for a journal on disk:
+
+- "send" (the default) fsyncs only the writes that precede a send: an intent
+  and a renewed deadline. In WAL mode an fsync covers every frame written
+  before it, and recovery after a power loss keeps a prefix of the log, so
+  every call that went out still has its intent and its latest deadline on
+  disk. What a power loss can take is the tail after the last send: a
+  decision (nothing was sent, so the planner is asked again), an attempt, or
+  a result (the step is recovered from its intent, as after any crash, at
+  worst with one more escalation).
+- "full" (`synchronous=FULL`) fsyncs every write.
+- "normal" (`synchronous=NORMAL`) never fsyncs. It survives a process kill,
+  because committed frames sit in the OS page cache, but a power loss can
+  take an intent whose call did go out: exactly the case the journal exists
+  to prevent.
 
 Fencing: each incarnation that takes over a run calls `acquire`, which bumps
 the run's epoch, and passes its epoch to every `append`. An append from an
@@ -36,6 +44,8 @@ KINDS = frozenset(
     {"decision", "intent", "attempt", "result", "status", "incarnation", "intent_voided", "approval",
      "deadline"}
 )
+BEFORE_SEND = frozenset({"intent", "deadline"})  # the writes "send" durability fsyncs
+DURABILITY = {"send": "fsync before each send", "full": "fsync every write", "normal": "no fsync"}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -146,20 +156,31 @@ class RunState:
 
 
 class Journal:
-    def __init__(self, path: str | Path = ":memory:", durability: str = "full") -> None:
-        if durability not in ("full", "normal"):
-            raise ValueError("durability must be 'full' or 'normal'")
+    def __init__(self, path: str | Path = ":memory:", durability: str = "send") -> None:
+        if durability not in DURABILITY:
+            raise ValueError(f"durability must be one of {sorted(DURABILITY)}")
         self.path = str(path)
+        self.durability = durability
+        self.fsyncs = 0  # committed writes that synced the WAL to disk
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False)
         if self.path != ":memory:":
             self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute(f"PRAGMA synchronous={durability.upper()}")
+        self._synced: bool | None = None
+        self._sync(durability == "full")
         self._conn.executescript(SCHEMA)
+
+    def _sync(self, on: bool) -> bool:
+        """Set whether the next commit fsyncs. Only between transactions."""
+        if on != self._synced:
+            self._conn.execute(f"PRAGMA synchronous={'FULL' if on else 'NORMAL'}")
+            self._synced = on
+        return on and self.path != ":memory:"
 
     def acquire(self, run_id: str) -> int:
         """Take a run over: returns a new epoch, and every older epoch is fenced off."""
         with self._lock:
+            self._sync(self.durability == "full")
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 self._conn.execute(
@@ -194,6 +215,8 @@ class Journal:
         body = json.dumps(payload, sort_keys=True)
         ts = time.time()
         with self._lock:
+            synced = self._sync(self.durability == "full"
+                                or (self.durability == "send" and kind in BEFORE_SEND))
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 if epoch is not None:
@@ -209,6 +232,7 @@ class Journal:
                 self._conn.execute("ROLLBACK")
                 raise
             self._conn.execute("COMMIT")
+            self.fsyncs += synced
         return Event(run_id, seq, kind, step, json.loads(body), ts)
 
     def events(self, run_id: str) -> list[Event]:

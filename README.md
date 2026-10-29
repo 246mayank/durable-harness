@@ -326,7 +326,19 @@ One gap is left: an incarnation that passed the fence check and hangs before its
 
 ### Journal durability
 
-The journal runs in WAL mode with `synchronous=FULL`, so every commit fsyncs the WAL. An intent is therefore on disk before the call it describes goes out, even through an OS crash or power loss. `synchronous=NORMAL` survives a process kill, because committed frames sit in the OS page cache, but it can lose the last few commits on power failure. A lost intent for a call that did go out is exactly what the journal exists to prevent. FULL is the default and what every result here uses. It roughly doubles wall time per run in the hard-kill runner, at one fsync per event. The tests exercise process death, not power loss.
+The journal runs in SQLite's WAL mode. Only the writes that a send depends on have to reach the disk before the send: its intent, and a renewed deadline. So by default (`send`) the journal fsyncs exactly those.
+
+This is safe for two reasons. An fsync covers every frame written before it, and recovery after a power loss keeps a prefix of the log. Every call that went out therefore still has its intent and its latest deadline on disk. A power loss can only take the tail after the last send:
+- a decision: nothing was sent, so the planner is asked again;
+- an attempt record;
+- a result: the step is recovered from its intent, as after any crash, at worst with one more escalation.
+
+`full` (`synchronous=FULL`) fsyncs every write. `normal` never fsyncs. It survives a process kill, because committed frames sit in the OS page cache, but a power loss can take an intent whose call did go out, which is exactly what the journal exists to prevent.
+
+Durability changes no decision the runtime makes, only what a power loss can take, so every count in the tables above is the same at any level. The tests check which writes fsync and exercise process death, not a real power cut. What each level costs:
+
+<!-- overhead:start -->
+<!-- overhead:end -->
 
 ## Layout
 
@@ -348,6 +360,7 @@ chaos/         driver.py       in-process crash/zombie driver and audit-log oper
                bench.py        -> results/results.md
                sweep.py        fault-rate sweep -> results/sweep.md
                sigkill.py      separate processes, hard kills -> results/sigkill.md
+               overhead.py     the journal's time per tool call -> results/overhead.md
                llm_ablation.py -> results/llm.md, results/llm_local.md
 tests/         platform, journal, errors, runtime, in-flight calls, crash matrix, baselines,
                invariants, LLM planners, Hypothesis properties
@@ -390,6 +403,10 @@ python -m chaos.sigkill
 ```
 
 ```bash
+python -m chaos.overhead
+```
+
+```bash
 python -m chaos.llm_ablation
 ```
 
@@ -397,7 +414,7 @@ python -m chaos.llm_ablation
 python -m chaos.llm_ablation --provider ollama --scenarios 50 --control
 ```
 
-`chaos.bench` writes `results/results.md`: 500 scenarios by 5 configs, the no-deadline ablation, and 200 zombie scenarios, a few minutes on a laptop. `chaos.sweep` writes `results/sweep.md`. `chaos.sigkill` writes `results/sigkill.md`. `chaos.llm_ablation` needs `GEMINI_API_KEY` and writes `results/llm.md`. With `--provider ollama` it uses a local model (`ollama pull qwen2.5:3b`) and writes `results/llm_local.md`.
+`chaos.bench` writes `results/results.md`: 500 scenarios by 5 configs, the no-deadline ablation, and 200 zombie scenarios, a few minutes on a laptop. `chaos.sweep` writes `results/sweep.md`. `chaos.sigkill` writes `results/sigkill.md`. `chaos.overhead` times the journal at each durability level and writes `results/overhead.md`. `chaos.llm_ablation` needs `GEMINI_API_KEY` and writes `results/llm.md`. With `--provider ollama` it uses a local model (`ollama pull qwen2.5:3b`) and writes `results/llm_local.md`.
 
 To watch a crash and a resume by hand, start the platform in one terminal:
 
@@ -440,6 +457,7 @@ python -m harness.trace runs/journal.db demo
 - **Fencing is journal-side.** It holds because both incarnations reach the same SQLite file, and the one stray send it can't stop is covered by the deadline. A distributed journal would need leases of its own. The zombie experiment hangs an incarnation only at hook points; `before_send` is among them, since that is the gap a hang can exploit.
 - **The conditional-write rule assumes one writer per campaign.** "The total grew by our amount, so it was ours" is only sound if nothing else allocates to that campaign.
 - **Tool calls are sequential.** Parallel calls would need per-call ordinals in the key and an intent for every in-flight call. The Gemini planner keeps only the first function call of a reply.
+- **`send` durability leans on SQLite and the disk.** It needs WAL recovery to keep a prefix of the log, and the disk to honor fsync. The tests check which writes fsync; nothing here cuts the power.
 - **Positional keys trust the journal.** If the journal is lost or truncated, or a run id is reused for a different goal, step N may be a different call under the same key.
 - **Platforms expire idempotency keys** (24 hours is common). A run suspended or escalated for longer would re-send an idempotent call under a key the platform has forgotten. The simulator never expires keys.
 - **Escalations are a real cost.** Under this fault mix the plain harness escalates often: every ambiguous allocation, including 500s that never committed in this simulator, so many escalations are false alarms. The benchmark's operator answers as soon as the deadline has passed; a person would take minutes.
