@@ -391,7 +391,8 @@ def render_resume_numbers(main: dict[str, list[RunReport]], zombies: dict[str, l
         "Wording rules: say \"simulated platform\", \"seeded scenarios\" and \"built and evaluated\". "
         "The numbers above come from the scripted planner with in-process crash injection; the "
         "hard-kill numbers (separate OS processes) are in sigkill.md, the fault-rate sweep in "
-        "sweep.md, and the small real-LLM run in llm.md, so cite those files for those claims. "
+        "sweep.md, every crash schedule in exhaustive.md, the journal's cost in overhead.md, and the "
+        "real-LLM runs in llm.md and llm_local.md, so cite those files for those claims. "
         "Never \"exactly-once\", \"production\" or \"deployed\".",
         "",
     ])
