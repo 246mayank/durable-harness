@@ -16,6 +16,11 @@ class Check:
     spend: int
     excess_spend: int
     unapproved: int | None  # unsafe effects with no approval; None if the gate is off
+    # Effects from a step that had already taken effect (same trace id): a
+    # recovery failure. A duplicate from a new step is a new planner decision.
+    # Step numbers only identify a step across incarnations in configs that
+    # replay the journal; without replay they restart at 0.
+    repeated_steps: int = 0
 
     @property
     def duplicate_total(self) -> int:
@@ -28,7 +33,7 @@ class Check:
     @property
     def clean(self) -> bool:
         return (self.duplicate_total == 0 and self.missing_total == 0
-                and self.excess_spend == 0 and not self.unapproved)
+                and self.excess_spend == 0 and not self.unapproved and self.repeated_steps == 0)
 
 
 def check(
@@ -38,6 +43,7 @@ def check(
     approved_traces: set[str] | None = None,
 ) -> Check:
     counts = Counter(e["kind"] for e in effects)
+    per_step = Counter(e["trace_id"] for e in effects if e["trace_id"])
     spend = sum(e["amount"] or 0 for e in effects if e["kind"] == "allocation")
     unapproved = None
     if approved_traces is not None:
@@ -51,4 +57,5 @@ def check(
         spend=spend,
         excess_spend=max(0, spend - expected_spend),
         unapproved=unapproved,
+        repeated_steps=sum(n - 1 for n in per_step.values()),
     )

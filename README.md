@@ -1,10 +1,12 @@
 # durable-harness
 
+[![CI](https://github.com/246mayank/durable-harness/actions/workflows/ci.yml/badge.svg)](https://github.com/246mayank/durable-harness/actions/workflows/ci.yml)
+
 **A Python agent runtime that resumes from a log instead of restarting, so side-effecting tool calls take effect once.**
 
 Agents that act on the world fail halfway through: they create an ad, send an email, move budget, and then the process dies, a response gets lost after the server committed, or a retry fires. `durable-harness` journals every planner decision and every tool intent to a SQLite write-ahead log *before* acting. After a crash it **replays the log rather than re-asking the planner**. Each call whose outcome is unknown is recovered according to the tool's declared **effect class**: re-send it, re-send it under the same key, look it up, or escalate it to a human.
 
-The guarantee is **at-least-once execution with idempotent effects**. A request may go out more than once, but its effect lands once. A call that can't be made safe is escalated, never guessed. The runtime is built and evaluated against a **simulated** ad/email platform with seeded fault injection. A B2B campaign agent drives it, using a scripted planner at scale and a real LLM for a small sample.
+The guarantee is **at-least-once execution with idempotent effects**. A request may go out more than once, but its effect lands once. A call that can't be made safe is escalated, never guessed. The runtime is built and evaluated against a **simulated** ad/email platform with seeded fault injection. A B2B campaign agent drives it, using a scripted planner at scale and real LLMs on smaller samples.
 
 ## Why resume, not restart
 
@@ -341,15 +343,16 @@ agents/        campaign.py     campaign tools, goal and scripted planner
                __main__.py     python -m agents: the agent over real HTTP
 platform_sim/  app.py faults.py db.py __main__.py    FastAPI + SQLite simulator
 chaos/         driver.py       in-process crash/zombie driver and audit-log operator
-               invariants.py   ground-truth checks
+               invariants.py   ground-truth checks: duplicates, missing effects, spend, steps applied twice
                scenarios.py    seeded scenario generation
                bench.py        -> results/results.md
                sweep.py        fault-rate sweep -> results/sweep.md
                sigkill.py      separate processes, hard kills -> results/sigkill.md
                llm_ablation.py -> results/llm.md, results/llm_local.md
 tests/         platform, journal, errors, runtime, in-flight calls, crash matrix, baselines,
-               Hypothesis properties
+               invariants, LLM planners, Hypothesis properties
 results/       generated only, never hand-edited
+.github/       CI: ruff, and pytest on Ubuntu and Windows
 ```
 
 The runtime itself (`harness/`) is under 1,000 lines.
@@ -372,7 +375,7 @@ On Windows, use `.venv\Scripts\pip` instead.
 pytest
 ```
 
-This includes the crash matrix and the Hypothesis schedules, which mix crashes, delayed delivery and zombie incarnations. The four generators:
+This includes the crash matrix and the Hypothesis schedules, which mix crashes, delayed delivery and zombie incarnations. `ruff check .` lints. CI runs both on every push to main: the tests on Ubuntu with Python 3.11, 3.12 and 3.13, and on Windows with 3.13. The four generators:
 
 ```bash
 python -m chaos.bench
@@ -441,7 +444,7 @@ python -m harness.trace runs/journal.db demo
 - **Platforms expire idempotency keys** (24 hours is common). A run suspended or escalated for longer would re-send an idempotent call under a key the platform has forgotten. The simulator never expires keys.
 - **Escalations are a real cost.** Under this fault mix the plain harness escalates often: every ambiguous allocation, including 500s that never committed in this simulator, so many escalations are false alarms. The benchmark's operator answers as soon as the deadline has passed; a person would take minutes.
 - **A crash between an unsafe call's intent and its send still escalates.** It can't be told apart from a crash after the send, and journaling a "sending" marker wouldn't help: the intent already is the last write before the send. The in-process crash points also over-weight this window. It is one point in four, but the real code spends microseconds there. The hard-kill runner kills at uniformly random times and has no such skew.
-- **The scripted planner runs at scale; the real LLMs only at small N.** A duplicate in an LLM run can be the model's own repeat decision. The control row separates those from recovery failures in aggregate, not run by run.
+- **The scripted planner runs at scale; the real LLMs only at small N.** A duplicate in an LLM run can be the model's own repeat decision. The local-model table separates the two run by run where a journal is replayed, by counting steps that took effect twice; for `keys_only` only the comparison with the control row is available.
 - **The main benchmark crashes in-process.** The hard-kill runner backs it up with real process kills, but neither one tests power loss or disk failure.
 
 ## Why not just Temporal?
@@ -462,4 +465,4 @@ The runtime here is small so the mechanism stays inspectable and measurable. The
 - Platform-side lookups (allocations by client reference, say) to cut escalations without preconditions.
 - A lease-based variant of deadlines for platforms that don't enforce them, with an explicit bound on request lifetime.
 - Effect classes as a library over Temporal activities.
-- A real-LLM evaluation with a stronger local model at larger N, attributing each duplicate to a step applied twice or to a new planner decision.
+- A real-LLM evaluation with a stronger local model at larger N.

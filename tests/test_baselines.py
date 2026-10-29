@@ -17,8 +17,12 @@ def total_duplicates(config: str, scenarios, **kw) -> int:
 
 def test_lost_acks_duplicate_under_naive_retry_but_not_harness():
     scenarios = [Scenario(seed=s, faults=FaultConfig(p_lost_ack=0.3, seed=s)) for s in range(10)]
-    assert total_duplicates("naive_retry", scenarios) > 0
-    assert total_duplicates("harness", scenarios) == 0
+    naive = [run_scenario(s, CONFIGS["naive_retry"]).check for s in scenarios]
+    harness = [run_scenario(s, CONFIGS["harness"]).check for s in scenarios]
+    assert sum(c.duplicate_total for c in naive) > 0
+    # Re-sent without a key, the same step lands twice: the checker sees it.
+    assert sum(c.repeated_steps for c in naive) > 0
+    assert all(c.duplicate_total == c.repeated_steps == 0 for c in harness)
 
 
 def test_restart_without_replay_redoes_everything():

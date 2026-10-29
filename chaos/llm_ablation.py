@@ -8,7 +8,9 @@ and the email, with light lost-ack faults. keys_only re-plans from the goal
 after the crash; the harness resumes from its journal. With --control, the
 harness also runs each scenario with no faults and no crashes: any
 "duplicate" there is the model's own planning mistake, which separates
-model mistakes from recovery failures. Small N, slow or rate-limited models:
+model mistakes from recovery failures in aggregate. Run by run, a step that
+took effect twice is a recovery failure; any other duplicate is a new step
+the model decided. Small N, slow or rate-limited models:
 a check that the scripted results carry over to real models, not a benchmark.
 """
 
@@ -93,7 +95,8 @@ def main() -> None:
         rows += group
         for report in group:
             print(f"scenario {scenario.seed} {report.config}: {report.status}, "
-                  f"dups {report.check.duplicates}, planner calls {report.planner_calls}", flush=True)
+                  f"dups {report.check.duplicates}, steps applied twice {report.check.repeated_steps}, "
+                  f"planner calls {report.planner_calls}", flush=True)
     if not rows:
         raise SystemExit(stopped or "no runs completed")
     n = len(rows) // len(configs)
@@ -101,10 +104,12 @@ def main() -> None:
     table = []
     for name in configs:
         rs = [r for r in rows if r.config == name]
+        replays = CONFIGS["harness" if name == CONTROL else name].replay
         table.append([
             f"`{name}`", len(rs), _pct(sum(r.finished for r in rs), len(rs)),
             _pct(sum(1 for r in rs if r.check.duplicate_total), len(rs)),
             *(sum(r.check.duplicates[k] for r in rs) for k in KINDS),
+            sum(r.check.repeated_steps for r in rs) if replays else "n/a",
             sum(r.check.missing_total for r in rs if r.finished),
             f"{sum(r.planner_calls for r in rs) / len(rs):.1f}",
         ])
@@ -129,11 +134,14 @@ def main() -> None:
         "benchmark.",
         "",
         _table(["config", "runs", "finished", "runs with a duplicate", *(f"dup {k}" for k in KINDS),
-                "missing (finished runs)", "planner calls / run"], table),
+                "steps applied twice", "missing (finished runs)", "planner calls / run"], table),
         "",
-        "A duplicate here can also be the model's own planning mistake (say, a fourth ad); the "
-        "invariant checker cannot tell the two apart and counts both."
-        + (f" The `{CONTROL}` row measures those mistakes alone: same scenarios, same model, "
+        "A duplicate here can also be the model's own planning mistake (say, a fourth ad). "
+        "`steps applied twice` tells the two apart: it counts effects from a step that had already "
+        "taken effect, which only a re-send can cause. Any other duplicate is a new step the model "
+        "decided. Without a journal to replay, `keys_only` "
+        "numbers its steps from 0 again after a crash, so the column doesn't apply to it."
+        + (f" The `{CONTROL}` row measures the model's mistakes alone: same scenarios, same model, "
            "nothing to recover from." if args.control else ""),
         "",
     ])
