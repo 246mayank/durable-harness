@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import functools
 import os
 import subprocess
 import time
@@ -26,7 +27,7 @@ from dataclasses import replace
 from pathlib import Path
 from statistics import mean
 
-from agents.campaign import campaign_tools
+from agents.campaign import ScriptedPlanner, campaign_tools
 from chaos.driver import RunReport, Scenario, run_scenario
 from chaos.invariants import KINDS
 from chaos.scenarios import generate, generate_zombies
@@ -69,8 +70,9 @@ DESCRIPTIONS = {
 def _run(task: tuple[Scenario, str, str, str]) -> tuple[str, RunReport]:
     scenario, name, durability, experiment = task
     config, conditional = VARIANTS[name]
+    planner = functools.partial(ScriptedPlanner, parallel=True) if experiment == "parallel" else ScriptedPlanner
     return experiment, run_scenario(scenario, config, tools=campaign_tools(conditional),
-                                    durability=durability)
+                                    durability=durability, planner_factory=planner)
 
 
 def _git_sha() -> str:
@@ -232,8 +234,32 @@ def render_inflight(main: dict[str, list[RunReport]], zombies: dict[str, list[Ru
     ])
 
 
+def render_parallel(main: dict[str, list[RunReport]], parallel: dict[str, list[RunReport]]) -> str:
+    """The parallel-calls section (also the README's `parallel` block)."""
+    stats = {name: summarize(parallel[name]) for name in BENCH}
+    sequential = {name: summarize(main[name]) for name in BENCH}
+    rows = [[f"`{name}`", _pct(s["finished"], s["runs"]), _pct(s["dup_runs"], s["runs"]), s["dups"],
+             f"${s['excess']:,}", s["missing"], f"{s['escalations']} in {s['esc_runs']} runs",
+             f"{s['planner_calls']:.1f} ({sequential[name]['planner_calls']:.1f})", s["crashes"], s["conflicts"]]
+            for name, s in stats.items()]
+    return "\n".join([
+        "The same scenarios, with a planner that decides the calls that don't depend on each other "
+        "at once: after the campaign, the 3 ads, the email and the initial budget go out as one "
+        "decision of 5 calls, so a clean run makes 5 planner calls instead of 9. The harness "
+        "journals the 5 intents in one transaction before the first call goes out, and recovers "
+        "each call from its own intent. Crash schedules count passes of each crash point, and a "
+        "batch passes `after_decision` and `after_intent` once, so fewer crashes land than above.",
+        "",
+        _table(["config", "finished", "runs with a duplicate", "duplicate effects", "excess spend",
+                "missing (finished runs)", "escalations", "planner calls / run (sequential)",
+                "crashes injected", "409s"], rows),
+        "",
+        bounds(stats),
+    ])
+
+
 def render(main: dict[str, list[RunReport]], zombies: dict[str, list[RunReport]],
-           scenarios: list[Scenario], n_zombies: int, args) -> str:
+           parallel: dict[str, list[RunReport]], scenarios: list[Scenario], n_zombies: int, args) -> str:
     n = len(scenarios)
     stats = {name: summarize(main[name]) for name in BENCH}
     out = [
@@ -311,6 +337,10 @@ def render(main: dict[str, list[RunReport]], zombies: dict[str, list[RunReport]]
         "",
         render_inflight(main, zombies, n_zombies),
         "",
+        "## Parallel tool calls",
+        "",
+        render_parallel(main, parallel),
+        "",
         "## Configs",
         "",
         *(f"- `{name}`: {DESCRIPTIONS[name]}" for name in VARIANTS),
@@ -324,9 +354,10 @@ def render(main: dict[str, list[RunReport]], zombies: dict[str, list[RunReport]]
 
 
 def render_resume_numbers(main: dict[str, list[RunReport]], zombies: dict[str, list[RunReport]],
-                          n: int, n_zombies: int) -> str:
+                          parallel: dict[str, list[RunReport]], n: int, n_zombies: int) -> str:
     s = {name: summarize(rs) for name, rs in main.items()}
     z = {name: summarize(rs) for name, rs in zombies.items()}
+    p = {name: summarize(rs) for name, rs in parallel.items()}
     return "\n".join([
         "# Numbers for the resume bullets",
         "",
@@ -353,6 +384,9 @@ def render_resume_numbers(main: dict[str, list[RunReport]], zombies: dict[str, l
         f"- zombie incarnations ({n_zombies} scenarios, {z['harness']['froze']} zombies): no fencing or "
         f"deadlines **{z['harness_neither']['dups']}** duplicate effects; fencing only "
         f"**{z['harness_nodeadline']['dups']}**; both **{z['harness']['dups']}**",
+        f"- parallel tool calls (same {n} scenarios, independent calls decided at once): harness "
+        f"duplicate side effects **{p['harness']['dups']}**, `keys_only` **{p['keys_only']['dups']}**; "
+        f"planner calls per run {p['harness']['planner_calls']:.1f} instead of {s['harness']['planner_calls']:.1f}",
         "",
         "Wording rules: say \"simulated platform\", \"seeded scenarios\" and \"built and evaluated\". "
         "The numbers above come from the scripted planner with in-process crash injection; the "
@@ -377,19 +411,21 @@ def main() -> None:
     zombie_scenarios = generate_zombies(args.zombies, args.seed)
     tasks = [(s, name, args.durability, "main") for name in BENCH + NO_DEADLINE for s in scenarios]
     tasks += [(s, name, args.durability, "zombie") for name in ZOMBIE for s in zombie_scenarios]
+    tasks += [(s, name, args.durability, "parallel") for name in BENCH for s in scenarios]
     started = time.perf_counter()
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
         results = list(pool.map(_run, tasks, chunksize=8))
-    main_runs: dict[str, list[RunReport]] = defaultdict(list)
-    zombie_runs: dict[str, list[RunReport]] = defaultdict(list)
+    runs: dict[str, dict[str, list[RunReport]]] = defaultdict(lambda: defaultdict(list))
     for experiment, report in results:
-        (main_runs if experiment == "main" else zombie_runs)[report.config].append(report)
+        runs[experiment][report.config].append(report)
+    main_runs, zombie_runs, parallel_runs = runs["main"], runs["zombie"], runs["parallel"]
 
     args.out.mkdir(parents=True, exist_ok=True)
-    (args.out / "results.md").write_text(render(main_runs, zombie_runs, scenarios, args.zombies, args),
-                                         encoding="utf-8", newline="\n")
+    (args.out / "results.md").write_text(
+        render(main_runs, zombie_runs, parallel_runs, scenarios, args.zombies, args),
+        encoding="utf-8", newline="\n")
     (args.out / "resume_numbers.md").write_text(
-        render_resume_numbers(main_runs, zombie_runs, len(scenarios), args.zombies),
+        render_resume_numbers(main_runs, zombie_runs, parallel_runs, len(scenarios), args.zombies),
         encoding="utf-8", newline="\n")
     if args.out.resolve() == RESULTS:
         stats = {name: summarize(main_runs[name]) for name in BENCH}
@@ -408,6 +444,7 @@ def main() -> None:
         ]))
         update_readme("inflight", render_inflight(main_runs, zombie_runs, args.zombies, heading="####"))
         update_readme("escalations", escalation_table(main_runs["harness"]))
+        update_readme("parallel", render_parallel(main_runs, parallel_runs))
     with open(args.out / "runs.csv", "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f, lineterminator="\n")
         writer.writerow(["experiment", "config", "seed", "temperature", "status", "incarnations",

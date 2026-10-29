@@ -207,6 +207,9 @@ class ScriptedPlanner:
     temperature: float = 0.0
     calls: int = 0
     _plan: _Plan | None = field(default=None, repr=False)
+    # Decide the calls that don't depend on each other (the ads, the email and the
+    # initial budget) at once, as one parallel decision.
+    parallel: bool = False
 
     def decide(self, goal: CampaignGoal, history: list[dict]) -> dict:
         self.calls += 1
@@ -224,6 +227,20 @@ class ScriptedPlanner:
         emailed = any(h["tool"] == "send_email_batch" for h in ok)
         email = _call("send_email_batch", "announce to the segment", segment=goal.email_segment,
                       subject=plan.subject, body=f"See what {goal.product} does for your close.")
+        allocations = [h["args"] for h in ok if h["tool"] == "allocate_budget"]
+        funded = any(a.get("ad_id") is None for a in allocations)
+        fund = _call("allocate_budget", "fund the campaign", campaign_id=cid, amount=goal.initial_budget)
+        if self.parallel:
+            calls = [_call("create_ad", f"ad {i + 1} of {goal.n_ads}", campaign_id=cid,
+                           headline=plan.ads[i][0], body=plan.ads[i][1]) for i in range(len(ads), goal.n_ads)]
+            if not emailed:
+                calls.insert(0, email) if plan.email_first else calls.append(email)
+            if not funded:
+                calls.append(fund)
+            if len(calls) > 1:
+                return {"calls": calls, "note": f"{len(calls)} independent calls at once"}
+            if calls:
+                return calls[0]
         if plan.email_first and not emailed:
             return email
         if len(ads) < goal.n_ads:
@@ -233,10 +250,8 @@ class ScriptedPlanner:
         if not emailed:
             return email
 
-        allocations = [h["args"] for h in ok if h["tool"] == "allocate_budget"]
-        if not any(a.get("ad_id") is None for a in allocations):
-            return _call("allocate_budget", "fund the campaign", campaign_id=cid,
-                         amount=goal.initial_budget)
+        if not funded:
+            return fund
         if not any(a.get("ad_id") for a in allocations):
             metrics = next((h["value"] for h in reversed(ok) if h["tool"] == "get_metrics"), None)
             ours = {ad["id"] for ad in ads}

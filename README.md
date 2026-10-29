@@ -117,6 +117,11 @@ Same scenarios as above; some requests stay in flight after their 504 and land l
 Fencing stops a woken incarnation from journaling or sending again. Deadlines cover the one send it may already have been about to make: by the time it goes out, its deadline has passed, because the new owner waited it out before acting on a negative lookup or an operator's check.
 <!-- inflight:end -->
 
+### Parallel tool calls
+
+<!-- parallel:start -->
+<!-- parallel:end -->
+
 ### Fault-rate sweep
 
 The same agent as the network gets worse, from no faults to 80% of requests drawing one. Crash schedules stay as in the main benchmark.
@@ -247,6 +252,16 @@ decision  ->  intent (before the call)  ->  attempt*  ->  result (after the call
 The crash-matrix test injects a crash at each of the four points, at each of the 9 steps, at temperature 0 and 0.7. A second variant crashes again in the same place during recovery. In every cell the harness finishes with no duplicate, missing or excess effect, in exactly 9 planner calls.
 
 Hooks also fire at `before_send`, after the fence check and just before the request leaves. A crash there looks the same as one at `after_intent`, but it is the one place where a hung incarnation can still send something once it wakes (see fencing below).
+
+### Parallel tool calls
+
+A planner can decide several calls at once (`{"calls": [...]}`), as LLM APIs do. The rules:
+- **Steps:** the decision is one journal event, and the fold turns it into one step per call. Each call keeps its own positional key.
+- **Intents:** all the calls' intents are committed in one transaction, with one fsync, before the first call goes out.
+- **Recovery:** after a crash, each call is recovered from its own intent by its effect class, exactly like a single call. The batch is never re-asked.
+- **Stopping partway:** if a call escalates or suspends the run, the calls this incarnation journaled but never sent get their intents voided. They re-execute later instead of being recovered as in doubt.
+
+A parallel crash matrix (4 points × 9 steps × 2 temperatures × `harness` and `harness_cas`) checks that a batch never duplicates and is never re-asked.
 
 ### Failure taxonomy
 
@@ -468,7 +483,9 @@ python -m harness.trace runs/journal.db demo
 - **Deadlines need the platform's cooperation.** The deadline rule works because this simulated platform refuses to process a request past its deadline. Most real APIs make no such promise. Without it, the fallback is a timing assumption: wait longer than any request could stay in flight. The simulator checks the deadline when processing starts, which here is also the commit; a real platform would have to check at commit. Both sides read one machine's clock; across machines the margin would have to cover clock skew.
 - **Fencing is journal-side.** It holds because both incarnations reach the same SQLite file, and the one stray send it can't stop is covered by the deadline. A distributed journal would need leases of its own. The zombie experiment hangs an incarnation only at hook points; `before_send` is among them, since that is the gap a hang can exploit.
 - **The conditional-write rule assumes one writer per campaign.** "The total grew by our amount, so it was ours" is only sound if nothing else allocates to that campaign.
-- **Tool calls are sequential.** Parallel calls would need per-call ordinals in the key and an intent for every in-flight call. The Gemini planner keeps only the first function call of a reply.
+- **Parallel calls go out one after another.** A batch's intents are journaled together and each call is recovered on its own, but the runtime sends the calls in order, which keeps the simulation deterministic. Concurrent sends would leave any subset of the batch in flight at a crash instead of a prefix. Recovery already treats each call on its own, so it wouldn't change.
+- **Batching costs escalations.** A crash after a batch's intents leaves all of its calls in doubt, so an unsafe call escalates even if it never went out. `harness_cas` avoids this.
+- **The LLM ablations ran one call per reply.** The LLM planners can return several calls (`parallel=True`), but the published LLM numbers predate that and kept only the first.
 - **`send` durability leans on SQLite and the disk.** It needs WAL recovery to keep a prefix of the log, and the disk to honor fsync. The tests check which writes fsync; nothing here cuts the power.
 - **Positional keys trust the journal.** If the journal is lost or truncated, or a run id is reused for a different goal, step N may be a different call under the same key.
 - **Platforms expire idempotency keys** (24 hours is common). A run suspended or escalated for longer would re-send an idempotent call under a key the platform has forgotten. The simulator never expires keys.
@@ -490,7 +507,7 @@ The runtime here is small so the mechanism stays inspectable and measurable. The
 
 ## Roadmap
 
-- Parallel tool calls, with per-call ordinals and batched intents.
+- Concurrent sends for parallel calls, and the LLM ablations rerun with parallel calls on.
 - Key expiry: recover an idempotent step older than the platform's key lifetime by lookup or escalation instead of re-sending.
 - Platform-side lookups (allocations by client reference, say) to cut escalations without preconditions.
 - A lease-based variant of deadlines for platforms that don't enforce them, with an explicit bound on request lifetime.

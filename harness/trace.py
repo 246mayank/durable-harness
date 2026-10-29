@@ -31,6 +31,9 @@ def format_event(e: Event) -> str:
         detail = {k: v for k, v in p.items() if k not in ("status", "args")}
         return f"   == {p['status']} {_short(detail, 90) if detail else ''}"
     if e.kind == "decision":
+        if p.get("calls"):
+            return "\n".join([f"{step} decide   {len(p['calls'])} calls at once"]
+                             + [f"step {e.step + j:<2}   {_call(call)}" for j, call in enumerate(p["calls"])])
         return f"{step} decide   " + ("finish" if p.get("finish") else _call(p))
     if e.kind == "intent":
         key = (p.get("key") or "-")[:10]

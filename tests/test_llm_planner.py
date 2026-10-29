@@ -43,6 +43,38 @@ def test_ollama_reply_without_a_tool_call_is_a_final_answer():
     assert planner.decide(CampaignGoal(), HISTORY) == {"finish": True, "note": "qwen2.5:3b"}
 
 
+TWO_ADS = [{"function": {"name": "create_ad", "arguments": {"campaign_id": "cmp_1", "headline": f"h{i}",
+                                                           "body": "b"}}} for i in (1, 2)]
+
+
+def test_ollama_parallel_keeps_every_call_of_a_reply():
+    planner, sent = ollama([{"tool_calls": TWO_ADS}])
+    planner.parallel = True
+    decision = planner.decide(CampaignGoal(), HISTORY)
+    assert [c["args"]["headline"] for c in decision["calls"]] == ["h1", "h2"]
+    assert "several tools in one turn" in sent[0]["messages"][0]["content"]
+
+    planner, sent = ollama([{"tool_calls": TWO_ADS}])  # the default: one call per reply
+    assert planner.decide(CampaignGoal(), HISTORY)["args"]["headline"] == "h1"
+    assert "exactly one tool per turn" in sent[0]["messages"][0]["content"]
+
+
+def test_parallel_drops_a_finish_that_comes_with_other_calls():
+    planner, _ = ollama([{"tool_calls": [TWO_ADS[0], {"function": {"name": "finish"}}]}])
+    planner.parallel = True
+    assert planner.decide(CampaignGoal(), HISTORY)["tool"] == "create_ad"  # finish waits for the ad
+
+
+def test_gemini_parallel_keeps_every_function_call(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    parts = [{"functionCall": {"name": c["function"]["name"], "args": c["function"]["arguments"]}}
+             for c in TWO_ADS]
+    client = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(
+        200, json={"candidates": [{"content": {"parts": parts}}]})))
+    planner = GeminiPlanner(campaign_tools(), min_interval=0, client=client, parallel=True)
+    assert len(planner.decide(CampaignGoal(), HISTORY)["calls"]) == 2
+
+
 def test_gemini_reply_without_a_function_call_is_an_error(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     client = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(

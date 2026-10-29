@@ -5,7 +5,9 @@ Per step, events are written in the order
     decision -> intent (before the call) -> attempt* -> result (after the call)
 
 Each event is its own committed transaction, so once `append` returns the
-event survives a process kill.
+event survives a process kill. A parallel decision is one event that the fold
+expands into one step per call; their intents are committed together, in one
+transaction (`append_many`).
 
 Durability, for a journal on disk:
 
@@ -116,7 +118,12 @@ class RunState:
         elif kind == "decision":
             if event.step != len(self.steps):
                 raise ValueError(f"decision for step {event.step}, expected {len(self.steps)}")
-            self.steps.append(StepState(event.step, p))
+            calls = p.get("calls")
+            if calls:  # a parallel decision: one step per call, decided together
+                for j, call in enumerate(calls):
+                    self.steps.append(StepState(event.step + j, {**call, "batch": [event.step, len(calls)]}))
+            else:
+                self.steps.append(StepState(event.step, p))
         else:
             step = self.steps[event.step]
             if kind == "intent":
@@ -136,10 +143,13 @@ class RunState:
 
     @property
     def current(self) -> StepState | None:
-        """The step in progress: decided but without a result."""
-        if self.steps and not self.steps[-1].done:
-            return self.steps[-1]
-        return None
+        """The step in progress: the first one decided but without a result."""
+        return next((s for s in self.steps if not s.done), None)
+
+    def batch(self, step: StepState) -> list[StepState]:
+        """`step` and the later steps decided with it that have no result yet."""
+        first, size = step.decision.get("batch", (step.index, 1))
+        return [s for s in self.steps[step.index:first + size] if not s.done]
 
     def history(self) -> list[dict]:
         """What the planner sees: each completed step's call and observation."""
@@ -210,13 +220,19 @@ class Journal:
     def append(self, run_id: str, kind: str, step: int | None, payload: dict[str, Any],
                epoch: int | None = None) -> Event:
         """Commit one event. With `epoch`, only if that epoch still owns the run."""
-        if kind not in KINDS:
-            raise ValueError(f"unknown event kind {kind!r}")
-        body = json.dumps(payload, sort_keys=True)
+        return self.append_many(run_id, [(kind, step, payload)], epoch)[0]
+
+    def append_many(self, run_id: str, items: list[tuple[str, int | None, dict[str, Any]]],
+                    epoch: int | None = None) -> list[Event]:
+        """Commit several events in one transaction: all of them or none, one fsync at most."""
+        for kind, _, _ in items:
+            if kind not in KINDS:
+                raise ValueError(f"unknown event kind {kind!r}")
+        bodies = [json.dumps(payload, sort_keys=True) for _, _, payload in items]
         ts = time.time()
         with self._lock:
             synced = self._sync(self.durability == "full"
-                                or (self.durability == "send" and kind in BEFORE_SEND))
+                                or (self.durability == "send" and any(k in BEFORE_SEND for k, _, _ in items)))
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 if epoch is not None:
@@ -224,16 +240,18 @@ class Journal:
                 (seq,) = self._conn.execute(
                     "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE run_id = ?", (run_id,)
                 ).fetchone()
-                self._conn.execute(
+                self._conn.executemany(
                     "INSERT INTO events (run_id, seq, kind, step, payload, ts) VALUES (?,?,?,?,?,?)",
-                    (run_id, seq, kind, step, body, ts),
+                    [(run_id, seq + i, kind, step, body, ts)
+                     for i, ((kind, step, _), body) in enumerate(zip(items, bodies, strict=True))],
                 )
             except BaseException:
                 self._conn.execute("ROLLBACK")
                 raise
             self._conn.execute("COMMIT")
             self.fsyncs += synced
-        return Event(run_id, seq, kind, step, json.loads(body), ts)
+        return [Event(run_id, seq + i, kind, step, json.loads(body), ts)
+                for i, ((kind, step, _), body) in enumerate(zip(items, bodies, strict=True))]
 
     def events(self, run_id: str) -> list[Event]:
         with self._lock:

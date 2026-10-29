@@ -14,6 +14,13 @@ A decided step is never re-asked. The planner is consulted only when no step
 is in progress, so a resumed run makes exactly the calls it had decided on,
 with the same arguments and the same positional keys.
 
+A planner may decide several calls at once ({"calls": [...]}). Each becomes a
+step of its own, with its own positional key; their intents are journaled
+together, in one transaction, before the first of them is sent, and each one
+is recovered from its own intent. If the run stops partway through (escalated
+or suspended), the intents of the calls it never sent are voided, so they
+re-execute rather than wait in doubt.
+
 Two more rules cover calls that may still be in flight:
 
 - Deadlines. Every send carries a deadline, journaled before the send, after
@@ -61,7 +68,7 @@ class Planner(Protocol):
     calls: int
 
     def decide(self, goal: Any, history: list[dict]) -> dict:
-        """Return {"tool": name, "args": {...}} or {"finish": True}."""
+        """Return {"tool": name, "args": {...}}, {"calls": [one of those, ...]} or {"finish": True}."""
 
 
 @dataclass(frozen=True)
@@ -159,22 +166,56 @@ class Runtime:
             if step.decision.get("finish"):
                 self._emit(state, "result", step.index, {"status": "ok", "value": None, "via": "finish"})
                 return self._stop(state, "finished", {"steps": len(state.steps)})
-            stop = self._execute(state, step)
+            stop = self._execute(state, state.batch(step))
             if stop is not None:
                 return stop
 
-    def _execute(self, state: RunState, step: StepState) -> Outcome | None:
-        tool = self.tools.get(step.decision.get("tool", ""))
-        if tool is None:
-            return self._fail(state, step, Rejected(f"unknown tool {step.decision.get('tool')!r}"))
-        try:
-            args = tool.args.model_validate(step.decision.get("args", {}))
-        except ValidationError as exc:
-            return self._fail(state, step, Rejected(f"invalid arguments: {exc.errors()}"))
+    def _execute(self, state: RunState, steps: list[StepState]) -> Outcome | None:
+        """Run one decision's unfinished calls: journal their new intents together, then send each."""
+        plan: list[tuple[StepState, Tool, Any, CallContext | None]] = []  # ctx None: recover
+        intents: list[tuple[StepState, dict]] = []
+        pending_spend = 0
+        for step in steps:
+            tool = self.tools.get(step.decision.get("tool", ""))
+            if tool is None:
+                self._fail(state, step, Rejected(f"unknown tool {step.decision.get('tool')!r}"))
+                continue
+            try:
+                args = tool.args.model_validate(step.decision.get("args", {}))
+            except ValidationError as exc:
+                self._fail(state, step, Rejected(f"invalid arguments: {exc.errors()}"))
+                continue
+            if step.intent is not None:  # journaled by an earlier incarnation: in doubt
+                plan.append((step, tool, args, None))
+                continue
+            prepared = self._prepare(state, step, tool, args, pending_spend)
+            if isinstance(prepared, Outcome):
+                return prepared
+            if prepared is None:  # failed before an intent; the failure is its result
+                continue
+            ctx, intent = prepared
+            pending_spend += tool.spend(args) if tool.spend is not None else 0
+            intents.append((step, intent))
+            plan.append((step, tool, args, ctx))
 
-        if step.intent is not None:
-            return self._recover(state, step, tool, args)
+        if intents:
+            self._emit_many(state, [("intent", step.index, intent) for step, intent in intents])
+            self._hook("after_intent", intents[0][0].index)
+        for n, (step, tool, args, ctx) in enumerate(plan):
+            stop = (self._recover(state, step, tool, args) if ctx is None
+                    else self._send(state, step, tool, args, ctx))
+            if stop is not None:
+                # Calls of this decision that this incarnation journaled but never sent:
+                # void them, so they re-execute instead of being recovered as in doubt.
+                for later, _, _, later_ctx in plan[n + 1:]:
+                    if later_ctx is not None:
+                        self._emit(state, "intent_voided", later.index, {"reason": "not sent: run stopped"})
+                return stop
+        return None
 
+    def _prepare(self, state: RunState, step: StepState, tool: Tool, args: Any,
+                 pending_spend: int) -> tuple[CallContext, dict] | Outcome | None:
+        """Gate a new call and build its intent. Outcome: stop the run; None: the step failed."""
         arg_dict = args.model_dump()
         if self.config.approvals and tool.effect is Effect.UNSAFE:
             digest = args_hash(tool.name, arg_dict)
@@ -184,7 +225,7 @@ class Runtime:
                     {"step": step.index, "tool": tool.name, "args": arg_dict, "args_hash": digest},
                 )
         if self.config.budget_cap is not None and tool.spend is not None:
-            reserved = self._reserved_spend(state) + tool.spend(args)
+            reserved = self._reserved_spend(state) + pending_spend + tool.spend(args)
             if reserved > self.config.budget_cap:
                 return self._fail(
                     state, step,
@@ -201,12 +242,10 @@ class Runtime:
             ctx = replace(ctx, precondition=precondition)
 
         ctx = replace(ctx, deadline=self._new_deadline())
-        self._emit(state, "intent", step.index, {
+        return ctx, {
             "tool": tool.name, "args": arg_dict, "key": ctx.key,
             "effect": tool.effect.value, "precondition": ctx.precondition, "deadline": ctx.deadline,
-        })
-        self._hook("after_intent", step.index)
-        return self._send(state, step, tool, args, ctx)
+        }
 
     # ---- calling and recovering -----------------------------------------------
 
@@ -333,6 +372,10 @@ class Runtime:
     def _emit(self, state: RunState, kind: str, step: int | None, payload: dict) -> StepState | None:
         state.apply(self.journal.append(state.run_id, kind, step, payload, epoch=self.epoch))
         return state.steps[step] if step is not None else None
+
+    def _emit_many(self, state: RunState, items: list[tuple[str, int | None, dict]]) -> None:
+        for event in self.journal.append_many(state.run_id, items, epoch=self.epoch):
+            state.apply(event)
 
     def _hook(self, point: str, step: int) -> None:
         if self.crash_hook is not None:

@@ -13,21 +13,30 @@ Deterministic: same output on every run, apart from the commit line.
 from __future__ import annotations
 
 import argparse
+import functools
 import itertools
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
-from agents.campaign import campaign_tools
+from agents.campaign import ScriptedPlanner, campaign_tools
 from chaos.bench import RESULTS, VARIANTS, _git_sha, _pct, _table, update_readme
 from chaos.driver import CrashAt, Scenario, run_scenario
 from harness.runtime import CRASH_POINTS
 
 STEPS = range(9)
 TEMPERATURES = (0.0, 0.7)
-CONFIGS = ["naive_retry", "keys_only", "harness", "harness_cas"]
-HARNESS = ["harness", "harness_cas"]  # the only configs run at the largest crash count
+# row label -> (config, parallel calls?, harness?); baselines run up to 2 crashes, the harness up to the max
+ROWS = {
+    "naive_retry": ("naive_retry", False, False),
+    "keys_only": ("keys_only", False, False),
+    "harness": ("harness", False, True),
+    "harness_cas": ("harness_cas", False, True),
+    "harness, parallel calls": ("harness", True, True),
+    "harness_cas, parallel calls": ("harness_cas", True, True),
+}
+CLEAN_PLANNER_CALLS = {False: 9, True: 5}  # a run without a crash: one call per step, or one batch of 5
 
 
 def schedules(k: int, monotone: bool = False) -> list[tuple[tuple[str, int], ...]]:
@@ -37,14 +46,16 @@ def schedules(k: int, monotone: bool = False) -> list[tuple[tuple[str, int], ...
 
 
 def _run(task: tuple[str, float, int, tuple]) -> tuple[str, int, dict]:
-    name, temperature, seed, schedule = task
+    label, temperature, seed, schedule = task
+    name, parallel, _ = ROWS[label]
     config, conditional = VARIANTS[name]
     report = run_scenario(
         Scenario(seed=seed, temperature=temperature), config, tools=campaign_tools(conditional),
+        planner_factory=functools.partial(ScriptedPlanner, parallel=parallel),
         hook_factory=lambda n: CrashAt(schedule[n][0], step=schedule[n][1]) if n < len(schedule) else None,
     )
     c = report.check
-    return name, len(schedule), {
+    return label, len(schedule), {
         "landed": report.crashes, "finished": report.finished, "dups": c.duplicate_total,
         "repeated": c.repeated_steps, "missing": c.missing_total if report.finished else 0,
         "escalations": report.escalations, "planner_calls": report.planner_calls,
@@ -52,27 +63,28 @@ def _run(task: tuple[str, float, int, tuple]) -> tuple[str, int, dict]:
 
 
 def render(rows: dict[tuple[str, int], list[dict]], max_crashes: int, elapsed: float) -> str:
+    labels = list(ROWS)
     table = []
-    for (name, k), rs in sorted(rows.items(), key=lambda kv: (kv[0][1], CONFIGS.index(kv[0][0]))):
+    for (label, k), rs in sorted(rows.items(), key=lambda kv: (kv[0][1], labels.index(kv[0][0]))):
         calls = [r["planner_calls"] for r in rs]
         table.append([
-            f"`{name}`", k, len(rs), _pct(sum(r["landed"] == k for r in rs), len(rs)),
+            f"`{label}`", k, len(rs), _pct(sum(r["landed"] == k for r in rs), len(rs)),
             _pct(sum(r["finished"] for r in rs), len(rs)), _pct(sum(1 for r in rs if r["dups"]), len(rs)),
             sum(r["dups"] for r in rs),
-            sum(r["repeated"] for r in rs) if VARIANTS[name][0].replay else "n/a",
+            sum(r["repeated"] for r in rs) if VARIANTS[ROWS[label][0]][0].replay else "n/a",
             sum(r["missing"] for r in rs), sum(r["escalations"] for r in rs), f"{min(calls)}-{max(calls)}",
         ])
-    harness = [r for (name, k), rs in rows.items() if name in HARNESS for r in rs]
-    landed = sum(1 for (name, k), rs in rows.items() if name in HARNESS for r in rs if r["landed"] == k)
-    clean = all(r["finished"] and not (r["dups"] or r["repeated"] or r["missing"]) for r in harness)
-    nine = all(r["planner_calls"] == len(STEPS) for r in harness)
+    harness = [(label, k, r) for (label, k), rs in rows.items() if ROWS[label][2] for r in rs]
+    landed = sum(1 for _, k, r in harness if r["landed"] == k)
+    clean = all(r["finished"] and not (r["dups"] or r["repeated"] or r["missing"]) for _, _, r in harness)
+    never_reasked = all(r["planner_calls"] == CLEAN_PLANNER_CALLS[ROWS[label][1]] for label, _, r in harness)
     command = "python -m chaos.exhaustive" + (f" --max-crashes {max_crashes}" if max_crashes != 3 else "")
     summary = (
         f"Across all {len(harness):,} harness runs ({landed:,} in which every scheduled crash landed), every "
         "one finished with no duplicate, no step applied twice and nothing missing" if clean else
         "Some harness runs were not clean: see the table"
-    ) + (f", and every one asked the planner exactly {len(STEPS)} times, as many as a run without a crash: "
-         "a decided step is never re-asked." if nine else ".")
+    ) + (", and every one asked the planner exactly as many times as the same run without a crash (9, or 5 "
+         "with parallel calls): a decided step is never re-asked." if never_reasked else ".")
     return "\n".join([
         "# Every crash schedule",
         "",
@@ -81,12 +93,13 @@ def render(rows: dict[tuple[str, int], list[dict]], max_crashes: int, elapsed: f
         f"A schedule crashes incarnation 1 at one (crash point, step), incarnation 2 at another, and so on: "
         f"{len(CRASH_POINTS)} crash points x {len(STEPS)} steps (8 tool calls and finish) per crash, every "
         f"combination, each at temperatures {' and '.join(str(t) for t in TEMPERATURES)}. Baselines run "
-        f"every schedule of up to 2 crashes; the harness configs up to {max_crashes}. Beyond 2 crashes, only "
-        "schedules whose steps never go back: a resumed harness run never revisits an earlier step, so a "
-        "crash aimed at one could not land. No faults, so every duplicate comes from a crash. A crash "
-        "aimed at a step its incarnation never runs (a resumed run skips finished steps) doesn't land, "
-        "so the table counts the schedules where all of them did. "
-        f"{sum(len(rs) for rs in rows.values()):,} runs in {elapsed / 60:.0f} minutes.",
+        f"every schedule of up to 2 crashes; the harness configs up to {max_crashes}, with the planner "
+        "deciding one call at a time and, in the parallel rows, deciding the 3 ads, the email and the "
+        "initial budget as one batch. Beyond 2 crashes, only schedules whose steps never go back: a "
+        "resumed harness run never revisits an earlier step, so a crash aimed at one could not land. No "
+        "faults, so every duplicate comes from a crash. A crash aimed at a step its incarnation never "
+        "runs (a resumed run skips finished steps) doesn't land, so the table counts the schedules where "
+        f"all of them did. {sum(len(rs) for rs in rows.values()):,} runs in {elapsed / 60:.0f} minutes.",
         "",
         _table(["config", "crashes per schedule", "runs", "all crashes landed", "finished",
                 "runs with a duplicate", "duplicate effects", "steps applied twice",
@@ -106,14 +119,14 @@ def main() -> None:
 
     tasks = []
     for k in range(1, args.max_crashes + 1):
-        names = CONFIGS if k <= 2 else HARNESS
+        labels = [label for label, (_, _, harness) in ROWS.items() if harness or k <= 2]
         for i, schedule in enumerate(schedules(k, monotone=k > 2)):
-            tasks += [(name, t, i, schedule) for name in names for t in TEMPERATURES]
+            tasks += [(label, t, i, schedule) for label in labels for t in TEMPERATURES]
     started = time.perf_counter()
     rows: dict[tuple[str, int], list[dict]] = {}
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
-        for name, k, row in pool.map(_run, tasks, chunksize=64):
-            rows.setdefault((name, k), []).append(row)
+        for label, k, row in pool.map(_run, tasks, chunksize=64):
+            rows.setdefault((label, k), []).append(row)
     text = render(rows, args.max_crashes, time.perf_counter() - started)
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "exhaustive.md").write_text(text, encoding="utf-8", newline="\n")

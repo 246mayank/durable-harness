@@ -35,8 +35,12 @@ Goal, for {product} aimed at {audience}. Do each of these exactly once:
 6. Allocate {boost} to the ad with the highest CTR (set ad_id).
 Then call finish.
 
-Call exactly one tool per turn. Use ids returned by earlier calls. If a call
+{per_turn} Use ids returned by earlier calls. If a call
 failed, decide from its error whether to retry it."""
+
+ONE_PER_TURN = "Call exactly one tool per turn."
+SEVERAL_PER_TURN = ("You may call several tools in one turn when none of them needs another's result; "
+                    "they run together.")
 
 FINISH = {"name": "finish", "description": "Call when every goal step is done."}
 
@@ -45,9 +49,10 @@ class PlannerError(RuntimeError):
     """The model didn't produce a usable tool call."""
 
 
-def _system(goal: CampaignGoal) -> str:
+def _system(goal: CampaignGoal, parallel: bool = False) -> str:
     return SYSTEM.format(product=goal.product, audience=goal.audience, n_ads=goal.n_ads,
-                         segment=goal.email_segment, initial=goal.initial_budget, boost=goal.boost)
+                         segment=goal.email_segment, initial=goal.initial_budget, boost=goal.boost,
+                         per_turn=SEVERAL_PER_TURN if parallel else ONE_PER_TURN)
 
 
 def _render(history: list[dict]) -> str:
@@ -66,6 +71,15 @@ def _decision(name: str, args: dict | None, model: str) -> dict:
     if name == "finish":
         return {"finish": True, "note": model}
     return {"tool": name, "args": {k: v for k, v in (args or {}).items() if v is not None}, "note": model}
+
+
+def _decisions(calls: list[tuple[str, dict | None]], model: str, parallel: bool) -> dict:
+    """One reply's tool calls as a decision: the first only, or all of them as a parallel decision."""
+    if parallel:
+        calls = [c for c in calls if c[0] != "finish"] or calls[:1]  # finish alone, or not at all
+    if not parallel or len(calls) == 1:
+        return _decision(*calls[0], model)
+    return {"calls": [_decision(name, args, model) for name, args in calls], "note": model}
 
 
 def _gemini_schema(schema: dict, defs: dict | None = None) -> dict:
@@ -100,12 +114,14 @@ class GeminiPlanner:
         model: str = "gemini-3.5-flash",
         min_interval: float = 4.0,
         client: httpx.Client | None = None,
+        parallel: bool = False,
     ) -> None:
         self.calls = 0
         self.seed = seed
         self.temperature = temperature
         self.model = model
         self.min_interval = min_interval
+        self.parallel = parallel  # keep every function call of a reply, not just the first
         self.client = client or httpx.Client(timeout=60)
         self.declarations = _declarations(tools) + [FINISH]
         self._last_request = 0.0
@@ -113,7 +129,7 @@ class GeminiPlanner:
     def decide(self, goal: CampaignGoal, history: list[dict]) -> dict:
         self.calls += 1
         body = {
-            "systemInstruction": {"parts": [{"text": _system(goal)}]},
+            "systemInstruction": {"parts": [{"text": _system(goal, self.parallel)}]},
             "contents": [{"role": "user", "parts": [{"text": _render(history)}]}],
             "tools": [{"functionDeclarations": self.declarations}],
             "toolConfig": {"functionCallingConfig": {"mode": "ANY"}},
@@ -123,15 +139,16 @@ class GeminiPlanner:
                 "thinkingConfig": {"thinkingLevel": "low"},
             },
         }
-        call = self._function_call(self._post(body))
-        return _decision(call["name"], call.get("args"), self.model)
+        calls = self._function_calls(self._post(body))
+        return _decisions([(c["name"], c.get("args")) for c in calls], self.model, self.parallel)
 
     @staticmethod
-    def _function_call(response: dict) -> dict:
-        for part in response["candidates"][0]["content"]["parts"]:
-            if "functionCall" in part:
-                return part["functionCall"]
-        raise PlannerError(f"no function call in response: {json.dumps(response)[:300]}")
+    def _function_calls(response: dict) -> list[dict]:
+        calls = [part["functionCall"] for part in response["candidates"][0]["content"]["parts"]
+                 if "functionCall" in part]
+        if not calls:
+            raise PlannerError(f"no function call in response: {json.dumps(response)[:300]}")
+        return calls
 
     def _post(self, body: dict) -> dict:
         key = os.environ["GEMINI_API_KEY"]
@@ -171,12 +188,14 @@ class OllamaPlanner:
         model: str = "qwen2.5:3b",
         base_url: str = OLLAMA,
         client: httpx.Client | None = None,
+        parallel: bool = False,
     ) -> None:
         self.calls = 0
         self.seed = seed
         self.temperature = temperature
         self.model = model
         self.base_url = base_url
+        self.parallel = parallel  # keep every tool call of a reply, not just the first
         self.client = client or httpx.Client(timeout=600)
         empty = {"type": "object", "properties": {}}
         self.declarations = [{"type": "function", "function": d}
@@ -184,7 +203,7 @@ class OllamaPlanner:
 
     def decide(self, goal: CampaignGoal, history: list[dict]) -> dict:
         self.calls += 1
-        messages = [{"role": "system", "content": _system(goal)},
+        messages = [{"role": "system", "content": _system(goal, self.parallel)},
                     {"role": "user", "content": _render(history)}]
         r = self.client.post(f"{self.base_url}/api/chat", json={
             "model": self.model, "messages": messages, "tools": self.declarations, "stream": False,
@@ -195,7 +214,8 @@ class OllamaPlanner:
         calls = r.json()["message"].get("tool_calls") or []
         if not calls:
             return {"finish": True, "note": f"{self.model} (answered without a tool call)"}
-        return _decision(calls[0]["function"]["name"], calls[0]["function"].get("arguments"), self.model)
+        return _decisions([(c["function"]["name"], c["function"].get("arguments")) for c in calls],
+                          self.model, self.parallel)
 
 
 def gemini_factory(tools: ToolRegistry, model: str = "gemini-3.5-flash", **kwargs: Any):
