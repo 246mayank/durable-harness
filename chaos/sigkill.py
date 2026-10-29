@@ -23,11 +23,11 @@ from pathlib import Path
 
 import httpx
 
+from agents.campaign import CampaignGoal
 from chaos.bench import RESULTS, _git_sha, _pct, _table, update_readme
 from chaos.driver import audit_operator, planner_seed
 from chaos.invariants import check
 from chaos.scenarios import generate
-from agents.campaign import CampaignGoal
 from harness.journal import Journal
 from harness.runtime import resolve
 

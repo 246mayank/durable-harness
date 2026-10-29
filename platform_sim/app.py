@@ -110,7 +110,7 @@ class FaultMiddleware:
     platform would have to make it part of the commit.
     """
 
-    def __init__(self, app, platform: "Platform") -> None:
+    def __init__(self, app, platform: Platform) -> None:
         self.app = app
         self.platform = platform
 

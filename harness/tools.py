@@ -96,7 +96,7 @@ class ToolRegistry:
     tools: dict[str, Tool] = field(default_factory=dict)
 
     @classmethod
-    def of(cls, tools: Iterable[Tool]) -> "ToolRegistry":
+    def of(cls, tools: Iterable[Tool]) -> ToolRegistry:
         registry = cls()
         for t in tools:
             if t.effect is Effect.RECONCILABLE and t.lookup is None:

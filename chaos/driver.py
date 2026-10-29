@@ -25,9 +25,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-warnings.filterwarnings("ignore", message="Using `httpx` with `starlette.testclient`")
-from fastapi.testclient import TestClient  # noqa: E402
-
 from agents.campaign import CampaignGoal, ScriptedPlanner, campaign_tools
 from chaos.invariants import Check, check
 from harness.clock import RealClock, VirtualClock
@@ -36,6 +33,9 @@ from harness.runtime import DEADLINE_MARGIN, Config, Outcome, Runtime, Simulated
 from harness.tools import ToolRegistry
 from platform_sim.app import create_app
 from platform_sim.faults import FaultConfig
+
+warnings.filterwarnings("ignore", message="Using `httpx` with `starlette.testclient`")
+from fastapi.testclient import TestClient  # noqa: E402
 
 MAX_INCARNATIONS = 12
 

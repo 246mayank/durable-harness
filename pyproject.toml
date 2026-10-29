@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "hypothesis>=6.100"]
+dev = ["pytest>=8", "hypothesis>=6.100", "ruff>=0.17,<0.18"]
 
 [tool.setuptools.packages.find]
 include = ["harness*", "agents*", "platform_sim*", "chaos*"]
@@ -25,3 +25,14 @@ include = ["harness*", "agents*", "platform_sim*", "chaos*"]
 testpaths = ["tests"]
 addopts = "-q"
 filterwarnings = ["ignore:Using `httpx` with `starlette.testclient`"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["UP042"]  # keep the (str, Enum) classes: StrEnum changes their str() and format()
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["agents.campaign.CampaignGoal"]  # a frozen dataclass
